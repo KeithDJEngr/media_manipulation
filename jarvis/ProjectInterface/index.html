@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Jarvis - Speech to Speech</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #0a0a0a;
+            color: #e0e0e0;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        .container {
+            display: flex;
+            height: 100vh;
+            gap: 2px;
+            padding: 2px;
+        }
+
+        .pane {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            background: #111;
+            border-radius: 8px;
+            padding: 20px;
+            overflow: hidden;
+        }
+
+        .pane-header {
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            color: #888;
+            margin-bottom: 16px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #222;
+        }
+
+        .user-pane {
+            background: #1a1a2e;
+        }
+
+        .llm-pane {
+            background: #1a2e1a;
+        }
+
+        #start-btn {
+            width: 120px;
+            height: 120px;
+            border-radius: 50%;
+            border: 3px solid #444;
+            background: #222;
+            color: #e0e0e0;
+            font-size: 14px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin-bottom: 20px;
+            align-self: center;
+        }
+
+        #start-btn:hover {
+            border-color: #666;
+            background: #333;
+        }
+
+        #start-btn.active {
+            border-color: #0f0;
+            background: #0a3a0a;
+            color: #0f0;
+            box-shadow: 0 0 20px rgba(0, 255, 0, 0.3);
+        }
+
+        #start-btn.listening {
+            border-color: #0f0;
+            background: #0a3a0a;
+            color: #0f0;
+            box-shadow: 0 0 20px rgba(0, 255, 0, 0.3);
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { box-shadow: 0 0 20px rgba(0, 255, 0, 0.3); }
+            50% { box-shadow: 0 0 30px rgba(0, 255, 0, 0.6); }
+        }
+
+        #start-btn.speaking {
+            border-color: #0af;
+            background: #0a2a3a;
+            color: #0af;
+            box-shadow: 0 0 20px rgba(0, 170, 255, 0.3);
+            animation: pulse-blue 1.5s infinite;
+        }
+
+        @keyframes pulse-blue {
+            0%, 100% { box-shadow: 0 0 20px rgba(0, 170, 255, 0.3); }
+            50% { box-shadow: 0 0 30px rgba(0, 170, 255, 0.6); }
+        }
+
+        .transcription {
+            flex: 1;
+            overflow-y: auto;
+            padding: 12px;
+            background: #0a0a0a;
+            border-radius: 6px;
+            font-size: 16px;
+            line-height: 1.6;
+            color: #ccc;
+        }
+
+        .transcription p {
+            margin-bottom: 12px;
+        }
+
+        .transcription .cursor {
+            display: inline-block;
+            width: 2px;
+            height: 1.2em;
+            background: #0f0;
+            animation: blink 1s infinite;
+            vertical-align: text-bottom;
+        }
+
+        .transcription .cursor-blue {
+            background: #0af;
+        }
+
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0; }
+        }
+
+        .status {
+            font-size: 12px;
+            color: #666;
+            margin-top: 8px;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="pane user-pane">
+            <div class="pane-header">User</div>
+            <button id="start-btn">Start</button>
+            <div class="transcription" id="user-transcription"></div>
+            <div class="status" id="user-status">Inactive</div>
+        </div>
+        <div class="pane llm-pane">
+            <div class="pane-header">LLM Response</div>
+            <div class="transcription" id="llm-transcription"></div>
+            <div class="status" id="llm-status">Waiting</div>
+        </div>
+    </div>
+
+    <script>
+        const startBtn = document.getElementById('start-btn');
+        const userTranscription = document.getElementById('user-transcription');
+        const llmTranscription = document.getElementById('llm-transcription');
+        const userStatus = document.getElementById('user-status');
+        const llmStatus = document.getElementById('llm-status');
+
+        let isRunning = false;
+        let audioContext = null;
+        let mediaStream = null;
+        let processor = null;
+        let ws = null;
+        let audioSinkId = null;
+
+        // Audio playback
+        let audioQueue = [];
+        let isPlaying = false;
+        let currentAudioBuffer = null;
+        let audioSource = null;
+        let audioContextForPlayback = null;
+
+        // WebSocket connections - use current host to work from any hostname
+        const origin = window.location.origin.replace(/^http/, 'ws');
+        const VAD_WS_URL = `${origin}/vad`;
+        const TTS_WS_URL = `${origin}/tts`;
+
+        // User state
+        let userMessageCount = 0;
+        let llmMessageCount = 0;
+
+         function appendUserTranscription(text) {
+            if (userMessageCount === 0) {
+                userTranscription.innerHTML = '';
+            }
+            let msgEl = userTranscription.querySelector(`#user-msg-${userMessageCount}`);
+            if (!msgEl) {
+                msgEl = document.createElement('p');
+                msgEl.id = `user-msg-${userMessageCount}`;
+                userTranscription.appendChild(msgEl);
+            }
+            msgEl.textContent = text;
+            userTranscription.scrollTop = userTranscription.scrollHeight;
+        }
+
+        function updateUserTranscription(text) {
+            let msgEl = userTranscription.querySelector(`#user-msg-${userMessageCount}`);
+            if (!msgEl) {
+                msgEl = document.createElement('p');
+                msgEl.id = `user-msg-${userMessageCount}`;
+                userTranscription.appendChild(msgEl);
+            }
+            msgEl.textContent = text;
+            userTranscription.scrollTop = userTranscription.scrollHeight;
+        }
+
+        function clearUserTranscription() {
+            userTranscription.innerHTML = '';
+        }
+
+        function appendLLMTranscription(text) {
+            if (llmMessageCount === 0) {
+                llmTranscription.innerHTML = '';
+            }
+            const p = document.createElement('p');
+            p.id = `llm-msg-${llmMessageCount}`;
+            p.textContent = text;
+            llmTranscription.appendChild(p);
+            llmTranscription.scrollTop = llmTranscription.scrollHeight;
+        }
+
+        function updateLLMTranscriptionStreaming(text) {
+            let msgEl = llmTranscription.querySelector(`#llm-msg-${llmMessageCount}`);
+            if (!msgEl) {
+                msgEl = document.createElement('p');
+                msgEl.id = `llm-msg-${llmMessageCount}`;
+                llmTranscription.appendChild(msgEl);
+            }
+            msgEl.textContent = text;
+            llmTranscription.scrollTop = llmTranscription.scrollHeight;
+        }
+
+        function clearLLMTranscription() {
+            llmTranscription.innerHTML = '';
+        }
+
+        function setLLMCursor(show) {
+            let cursor = llmTranscription.querySelector('.cursor');
+            if (show) {
+                if (!cursor) {
+                    cursor = document.createElement('span');
+                    cursor.className = 'cursor cursor-blue';
+                    let msgEl = llmTranscription.querySelector(`#llm-msg-${llmMessageCount}`);
+                    if (msgEl) {
+                        msgEl.appendChild(cursor);
+                    } else {
+                        const p = document.createElement('p');
+                        p.id = `llm-msg-${llmMessageCount}`;
+                        p.appendChild(cursor);
+                        llmTranscription.appendChild(p);
+                    }
+                }
+            } else if (cursor) {
+                cursor.remove();
+            }
+        }
+
+        // Audio capture
+        async function startAudioCapture() {
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                alert('Microphone not supported in this browser. Please use http://localhost:8765/ or https:// and a modern browser (Chrome, Firefox, Edge).');
+                return;
+            }
+            try {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                    sampleRate: 16000
+                });
+                mediaStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        channelCount: 1,
+                        sampleRate: 16000
+                    }
+                });
+
+                const source = audioContext.createMediaStreamSource(mediaStream);
+                processor = audioContext.createScriptProcessor(1024, 1, 1);
+
+                processor.onaudioprocess = (e) => {
+                    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+                    const inputData = e.inputBuffer.getChannelData(0);
+                    const float32Data = new Float32Array(inputData.length);
+                    for (let i = 0; i < inputData.length; i++) {
+                        float32Data[i] = inputData[i];
+                    }
+                    const int16Data = new Int16Array(float32Data.length);
+                    for (let i = 0; i < float32Data.length; i++) {
+                        const s = Math.max(-1, Math.min(1, float32Data[i]));
+                        int16Data[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                    }
+                    ws.send(int16Data.buffer);
+                };
+
+                source.connect(processor);
+                processor.connect(audioContext.destination);
+            } catch (err) {
+                console.error('Audio capture error:', err);
+                alert('Microphone access denied or error: ' + err.message);
+            }
+        }
+
+        function stopAudioCapture() {
+            if (processor) {
+                processor.disconnect();
+                processor = null;
+            }
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(t => t.stop());
+                mediaStream = null;
+            }
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+        }
+
+        // Audio playback
+        function initPlaybackContext() {
+            if (!audioContextForPlayback) {
+                audioContextForPlayback = new (window.AudioContext || window.webkitAudioContext)();
+            }
+        }
+
+        function playAudioChunk(base64Data) {
+            initPlaybackContext();
+            if (audioContextForPlayback.state === 'suspended') {
+                audioContextForPlayback.resume();
+            }
+
+            const binaryString = atob(base64Data);
+            const uint8 = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+                uint8[i] = binaryString.charCodeAt(i);
+            }
+            const samples = new Float32Array(uint8.buffer, uint8.byteOffset, uint8.byteLength / 4);
+
+            const buffer = audioContextForPlayback.createBuffer(1, samples.length, 16000);
+            buffer.getChannelData(0).set(samples);
+
+            audioQueue.push(buffer);
+            if (!isPlaying) {
+                playNextBuffer();
+            }
+        }
+
+        function playNextBuffer() {
+            if (audioQueue.length === 0) {
+                isPlaying = false;
+                llmStatus.textContent = 'Idle';
+                return;
+            }
+
+            isPlaying = true;
+            llmStatus.textContent = 'Speaking...';
+            startBtn.classList.add('speaking');
+
+            currentAudioBuffer = audioQueue.shift();
+            if (audioSource) {
+                try { audioSource.stop(); } catch(e) {}
+            }
+
+            audioSource = audioContextForPlayback.createBufferSource();
+            audioSource.buffer = currentAudioBuffer;
+            audioSource.connect(audioContextForPlayback.destination);
+
+            audioSource.onended = () => {
+                audioSource = null;
+                currentAudioBuffer = null;
+                playNextBuffer();
+            };
+
+            audioSource.start();
+        }
+
+        function stopPlayback() {
+            if (audioSource) {
+                try { audioSource.stop(); } catch(e) {}
+                audioSource = null;
+            }
+            audioQueue = [];
+            currentAudioBuffer = null;
+            isPlaying = false;
+            llmStatus.textContent = 'Idle';
+            startBtn.classList.remove('speaking');
+        }
+
+        // WebSocket connections
+        function connectVAD() {
+            ws = new WebSocket(VAD_WS_URL);
+
+            ws.onopen = () => {
+                console.log('VAD WebSocket connected');
+            };
+
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+
+                 switch (data.type) {
+                    case 'user_transcript':
+                    case 'user_partial':
+                        if (data.type === 'user_partial' && userMessageCount === 0) {
+                            userMessageCount++;
+                        }
+                        appendUserTranscription(data.text);
+                        break;
+
+                    case 'llm_transcript':
+                        if (data.final) {
+                            llmMessageCount++;
+                            setLLMCursor(false);
+                        } else {
+                            setLLMCursor(true);
+                            updateLLMTranscriptionStreaming(data.text);
+                        }
+                        break;
+
+                    case 'llm_audio':
+                        playAudioChunk(data.audio);
+                        break;
+
+                    case 'user_start':
+                        userStatus.textContent = 'Listening...';
+                        userMessageCount = 0;
+                        clearUserTranscription();
+                        break;
+
+                    case 'user_end':
+                        userStatus.textContent = 'Processing...';
+                        break;
+
+                    case 'llm_start':
+                        llmMessageCount = 0;
+                        clearLLMTranscription();
+                        setLLMCursor(true);
+                        llmStatus.textContent = 'Thinking...';
+                        break;
+
+                    case 'llm_end':
+                        llmStatus.textContent = 'Idle';
+                        break;
+
+                    case 'interrupt':
+                        stopPlayback();
+                        clearLLMTranscription();
+                        llmMessageCount = 0;
+                        break;
+                }
+            };
+
+            ws.onclose = () => {
+                console.log('VAD WebSocket disconnected, reconnecting...');
+                userStatus.textContent = 'Reconnecting...';
+                setTimeout(connectVAD, 2000);
+            };
+
+            ws.onerror = (err) => {
+                console.error('VAD WebSocket error:', err);
+            };
+        }
+
+        // Main toggle
+        startBtn.addEventListener('click', async () => {
+            if (!isRunning) {
+                isRunning = true;
+                startBtn.textContent = 'Stop';
+                startBtn.classList.add('active');
+                userStatus.textContent = 'Starting...';
+                llmStatus.textContent = 'Waiting';
+
+                await startAudioCapture();
+                connectVAD();
+            } else {
+                isRunning = false;
+                startBtn.textContent = 'Start';
+                startBtn.classList.remove('active', 'listening', 'speaking');
+                userStatus.textContent = 'Inactive';
+                llmStatus.textContent = 'Waiting';
+
+                stopAudioCapture();
+                stopPlayback();
+
+                if (ws) {
+                    ws.close();
+                    ws = null;
+                }
+            }
+        });
+    </script>
+</body>
+</html>

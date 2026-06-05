@@ -1,0 +1,4 @@
+nano-parakeet
+sentencepiece
+torch
+numpy
