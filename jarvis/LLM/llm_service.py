@@ -197,6 +197,7 @@ async def handle_llm(websocket, llm_service):
 
                     # Generate response and stream tokens
                     async for token_data in llm_service.generate_response(user_text):
+                        logger.info(f"received {token_data}")
                         await websocket.send(json.dumps(token_data))
 
                     # Send end signal

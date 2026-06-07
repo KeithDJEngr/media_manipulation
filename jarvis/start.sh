@@ -137,7 +137,7 @@ sleep 2
 
 # Start TTS service
 echo "Starting TTS service..."
-SERVER_HOST=${HOST} SERVER_PORT=${PORT} TTS_DEVICE=${TTS_DEVICE:-cpu} nohup .venv/bin/python TTS/tts_service.py > /tmp/jarvis_tts.log 2>&1 &
+SERVER_HOST=${HOST} SERVER_PORT=${PORT} TTS_DEVICE=${TTS_DEVICE:-xpu} nohup .venv/bin/python TTS/tts_service.py > /tmp/jarvis_tts.log 2>&1 &
 TTS_PID=$!
 disown $TTS_PID
 

@@ -27,6 +27,7 @@ import ssl
 import numpy as np
 import torch
 import websockets
+import soundfile as sf
 from qwen_tts import Qwen3TTSModel
 
 logging.basicConfig(
@@ -39,15 +40,16 @@ logger = logging.getLogger(__name__)
 SAMPLE_RATE = 16000
 TTS_MODEL = os.getenv(
     "TTS_MODEL",
-    "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+    "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
 )
-TTS_DEVICE = os.getenv("TTS_DEVICE", "cpu")
+TTS_DEVICE = os.getenv("TTS_DEVICE", "xpu")
 TTS_DTYPE = os.getenv("TTS_DTYPE", "float32")
 TTS_VOICE_INSTRUCT = os.getenv(
     "TTS_VOICE_INSTRUCT",
     "Speak in a calm, natural conversational tone.",
 )
 TTS_LANGUAGE = os.getenv("TTS_LANGUAGE", "Auto")
+TTS_SPEAKER = os.getenv("TTS_SPEAKER", "eric")
 TTS_CHUNK_WORDS = int(os.getenv("TTS_CHUNK_WORDS", "10"))  # Process every N words
 TTS_MAX_CHUNK_DURATION = float(os.getenv("TTS_MAX_CHUNK_DURATION", "3.0"))  # Max seconds before forcing chunk
 
@@ -63,15 +65,29 @@ class QwenTTSProcessor:
     when the user speaks again.
     """
 
-    def __init__(self, model_path, device, dtype_str, voice_instruct, language):
+    def __init__(self, model_path, device, dtype_str, voice_instruct, language, speaker):
         self.is_generating = False
         self.interrupt_event = asyncio.Event()
         self.text_buffer = ""
         self.current_chunk_text = ""
         self.processed_words = 0
+        self.speaker = speaker
+        self.last_generated_text = ""
+        self.last_generated_len = 0
+
+        # Auto-detect device
+        if device == "xpu":
+            try:
+                import torch.xpu
+                if torch.xpu.device_count() == 0:
+                    logger.warning("XPU device count is zero, falling back to CPU")
+                    device = "cpu"
+            except Exception:
+                logger.warning("Failed to detect XPU, falling back to CPU")
+                device = "cpu"
 
         # Load and pre-warm model
-        logger.info(f"Loading Qwen3-TTS model: {model_path}")
+        logger.info(f"Loading Qwen3-TTS model: {model_path} on {device}")
         dtype = _parse_dtype(dtype_str)
         if "cpu" in device:
             logger.info("oneDNN optimizations enabled by default on CPU")
@@ -79,7 +95,7 @@ class QwenTTSProcessor:
             model_path,
             device_map=device,
             dtype=dtype,
-            attn_implementation="eager",
+            attn_implementation="sdpa",
         )
         logger.info("Model loaded")
 
@@ -89,8 +105,9 @@ class QwenTTSProcessor:
         # Pre-warm with a short utterance
         logger.info("Pre-warming model...")
         try:
-            wavs, sr = self.model.generate_voice_design(
+            wavs, sr = self.model.generate_custom_voice(
                 text="Hello.",
+                speaker=speaker,
                 instruct=voice_instruct,
                 language=language,
                 non_streaming_mode=True,
@@ -114,12 +131,15 @@ class QwenTTSProcessor:
             return
 
         if partial:
-            self.current_chunk_text = text
             current_words = len(text.split())
             new_words = current_words - self.processed_words
             if new_words <= 0:
                 return
 
+            # Extract only the new words that haven't been processed yet
+            words = text.split()
+            new_text = " ".join(words[self.processed_words:])
+            self.current_chunk_text = new_text
             self.processed_words = current_words
 
             # Check if we should process this chunk
@@ -130,18 +150,26 @@ class QwenTTSProcessor:
 
             if should_process:
                 yield self._process_chunk(self.current_chunk_text)
+                self.current_chunk_text = ""
                 self.processed_words = current_words
         else:
             # Final token - process remaining text
-            self.current_chunk_text = text
-            yield self._process_chunk(self.current_chunk_text)
+            current_words = len(text.split())
+            new_words = current_words - self.processed_words
+            if new_words > 0:
+                words = text.split()
+                self.current_chunk_text = " ".join(words[self.processed_words:])
+                yield self._process_chunk(self.current_chunk_text)
             self.processed_words = 0
+            self.current_chunk_text = ""
 
     def reset_buffer(self):
         """Reset for new response."""
         self.text_buffer = ""
         self.current_chunk_text = ""
         self.processed_words = 0
+        self.last_generated_text = ""
+        self.last_generated_len = 0
         self.interrupt_event.clear()
 
     def interrupt(self):
@@ -170,8 +198,9 @@ class QwenTTSProcessor:
         gen_start = _time.time()
 
         try:
-            wavs, sr = self.model.generate_voice_design(
+            wavs, sr = self.model.generate_custom_voice(
                 text=text.strip(),
+                speaker=self.speaker,
                 instruct=self.voice_instruct,
                 language=self.language,
                 non_streaming_mode=True,
@@ -224,9 +253,24 @@ class QwenTTSProcessor:
     def generate_audio_chunks(self, text):
         """Generator that yields audio chunks from text.
 
-        Handles interruption - stops generating when interrupted.
+        Skips redundant generation - if the same text has already been generated
+        (from a previous partial message), skips to avoid regenerating audio.
+        Also skips shorter texts that are prefixes of already-generated text,
+        since they will be replaced by the longer version anyway.
         """
-        for result in self._process_chunk(text):
+        stripped = text.strip()
+        if not stripped:
+            return
+        if stripped == self.last_generated_text:
+            return
+        # Skip if this text is shorter than what we've already generated
+        # and is a prefix of it (will be replaced by the longer version)
+        if len(stripped) < self.last_generated_len and self.last_generated_text.startswith(stripped):
+            return
+        self.last_generated_text = stripped
+        self.last_generated_len = len(stripped)
+
+        for result in self._process_chunk(stripped):
             if self.interrupt_event.is_set():
                 logger.info("TTS interrupted, stopping generation")
                 yield {
@@ -351,7 +395,8 @@ async def handle_tts(websocket, tts_processor):
                             "type": "audio_end",
                             "total_chunks": local_chunk_id,
                         }))
-                        logger.info(f"TTS generation complete ({local_chunk_id} chunks)")
+                        if local_chunk_id > 0:
+                            logger.info(f"TTS generation complete ({local_chunk_id} chunks)")
 
                     chunk_queue: asyncio.Queue = asyncio.Queue()
                     generation_complete = asyncio.Event()
@@ -398,6 +443,7 @@ async def main():
         dtype_str=TTS_DTYPE,
         voice_instruct=TTS_VOICE_INSTRUCT,
         language=TTS_LANGUAGE,
+        speaker=TTS_SPEAKER,
     )
 
     # Connect to server
