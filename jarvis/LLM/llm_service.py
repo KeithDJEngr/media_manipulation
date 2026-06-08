@@ -74,6 +74,7 @@ async def handle_llm(websocket, llm_info):
                     await websocket.send(json.dumps({"type": "llm_start"}))
                     
                     last_token = None
+                    llm_msg = ""
 
                     # Generate response and stream tokens
                     #llm_service.add_user_message(user_text)
@@ -159,8 +160,11 @@ async def handle_llm(websocket, llm_info):
 
 
                     
-                    # Send end signal
-                    await websocket.send(json.dumps({"type": "llm_end"}))
+                    # Send end signal with accumulated text
+                    await websocket.send(json.dumps({
+                        "type": "llm_end",
+                        "text": llm_msg,
+                    }))
                     
                     # FIX: Check if last_token exists before logging
                     if last_token:

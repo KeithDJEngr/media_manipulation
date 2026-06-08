@@ -250,6 +250,22 @@ class QwenTTSProcessor:
         except Exception as e:
             logger.error(f"TTS generation error: {e}")
 
+    def split_into_sentences(self, text):
+        """Split text into sentences using sentence boundary detection.
+        
+        Preserves sentence-ending punctuation. Returns list of sentences.
+        """
+        stripped = text.strip()
+        if not stripped:
+            return []
+        
+        # Split on sentence boundaries while preserving the delimiter
+        sentences = re.split(r'(?<=[.!?])\s+', stripped)
+        
+        # Filter empty sentences
+        result = [s.strip() for s in sentences if s.strip()]
+        return result
+
     def generate_audio_chunks(self, text):
         """Generator that yields audio chunks from text.
 
@@ -281,6 +297,47 @@ class QwenTTSProcessor:
                 }
                 return
             yield result
+
+    def generate_sentences_in_order(self, text):
+        """Generate audio for each sentence in order.
+        
+        Splits text into sentences and generates audio for each one
+        sequentially (in order), yielding audio chunks as they're ready.
+        This ensures sentences play in the same order they were generated.
+        """
+        stripped = text.strip()
+        if not stripped:
+            return
+        
+        sentences = self.split_into_sentences(stripped)
+        if not sentences:
+            # No clear sentence boundaries, process as single chunk
+            for chunk in self.generate_audio_chunks(stripped):
+                yield chunk
+            return
+        
+        logger.info(f"Split text into {len(sentences)} sentences for TTS")
+        
+        for i, sentence in enumerate(sentences):
+            if self.interrupt_event.is_set():
+                logger.info("TTS interrupted during sentence processing")
+                yield {
+                    "type": "audio_chunk",
+                    "audio": "",
+                    "chunk_id": -1,
+                    "interrupted": True,
+                }
+                return
+            
+            logger.info(f"Generating audio for sentence {i+1}/{len(sentences)}: \"{sentence[:60]}...\"")
+            
+            for chunk in self.generate_audio_chunks(sentence):
+                if chunk.get("interrupted"):
+                    yield chunk
+                    return
+                chunk["sentence_index"] = i
+                chunk["total_sentences"] = len(sentences)
+                yield chunk
 
 
 def _parse_dtype(dtype_str):
@@ -346,7 +403,7 @@ async def handle_tts(websocket, tts_processor):
 
                     logger.info(f"TTS received text (partial={partial}): \"{text[:80]}...\"")
 
-                    # Reset buffer on new response
+                    # Reset buffer on new complete response
                     if not partial:
                         tts_processor.reset_buffer()
 
@@ -355,9 +412,17 @@ async def handle_tts(websocket, tts_processor):
 
                         def generate_chunks():
                             try:
-                                for chunk in tts_processor.generate_audio_chunks(text):
-                                    logger.info(f"Queuing audio: {chunk}")
-                                    chunk_queue.put_nowait(chunk)
+                                if partial:
+                                    # Partial token - accumulate and process incrementally
+                                    for chunk in tts_processor.accumulate_text(text, partial=True):
+                                        if isinstance(chunk, dict):
+                                            logger.info(f"Queuing audio: {chunk}")
+                                            chunk_queue.put_nowait(chunk)
+                                else:
+                                    # Complete response - process sentence by sentence in order
+                                    for chunk in tts_processor.generate_sentences_in_order(text):
+                                        logger.info(f"Queuing audio: {chunk}")
+                                        chunk_queue.put_nowait(chunk)
                             except Exception as e:
                                 logger.error(f"Generation error: {e}")
                             generation_complete.set()

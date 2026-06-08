@@ -314,6 +314,9 @@ async def handle_llm(websocket):
     """
     await manager.register_llm(websocket)
     
+    # Accumulate tokens for complete response
+    accumulated_llm_text = ""
+
     try:
         async for message in websocket:
             try:
@@ -322,30 +325,30 @@ async def handle_llm(websocket):
                 
                 # Handle messages from LLM service (llm_start, llm_token, llm_end)
                 if msg_type == "llm_start":
+                    accumulated_llm_text = ""
                     await manager.broadcast_to_client({"type": "llm_start"})
                     
                 elif msg_type == "llm_token":
-                    # Forward to TTS for audio generation
-                    await manager.forward_message("llm", "tts", {
-                        "type": "tts_input",
-                        "text": data.get("text", ""),
-                        "partial": data.get("partial", True)
-                    })
-                    # Show transcript to browser
+                    token_text = data.get("text", "")
+                    accumulated_llm_text += token_text
+                    # Show transcript to browser (individual tokens for streaming display)
                     await manager.broadcast_to_client({
                         "type": "llm_transcript",
-                        "text": data.get("text", ""),
-                        "final": not data.get("partial", True)
+                        "text": accumulated_llm_text,
+                        "partial": True
                     })
                     
                 elif msg_type == "llm_end":
                     await manager.broadcast_to_client({"type": "llm_end"})
-                    if manager.tts_ws and manager.tts_ws.state.name == "OPEN":
-                        await manager.tts_ws.send(json.dumps({
+                    # Send complete accumulated text to TTS for sentence-level processing
+                    if accumulated_llm_text.strip():
+                        await manager.forward_message("llm", "tts", {
                             "type": "tts_input",
-                            "text": data.get("text", ""),
+                            "text": accumulated_llm_text,
                             "partial": False,
-                        }))
+                        })
+                        logger.info(f"Sent complete LLM response to TTS: \"{accumulated_llm_text[:80]}...\"")
+                    accumulated_llm_text = ""
                     
                 # Handle messages from browser/client (user_input)
                 elif msg_type == "user_input":
@@ -374,6 +377,8 @@ async def handle_llm_service(websocket):
     await websocket.send(json.dumps({"type": "start"}))
     logger.info("LLM service ready")
     
+    accumulated_llm_text = ""
+    
     try:
         async for message in websocket:
             try:
@@ -381,28 +386,29 @@ async def handle_llm_service(websocket):
                 msg_type = data.get("type")
                 
                 if msg_type == "llm_start":
+                    accumulated_llm_text = ""
                     await manager.broadcast_to_client({"type": "llm_start"})
                     
                 elif msg_type == "llm_token":
-                    await manager.forward_message("llm", "tts", {
-                        "type": "tts_input",
-                        "text": data.get("text", ""),
-                        "partial": data.get("partial", True)
-                    })
+                    token_text = data.get("text", "")
+                    accumulated_llm_text += token_text
                     await manager.broadcast_to_client({
                         "type": "llm_transcript",
-                        "text": data.get("text", ""),
-                        "final": not data.get("partial", True)
+                        "text": accumulated_llm_text,
+                        "partial": True
                     })
                     
                 elif msg_type == "llm_end":
                     await manager.broadcast_to_client({"type": "llm_end"})
-                    if manager.tts_ws and manager.tts_ws.state.name == "OPEN":
-                        await manager.tts_ws.send(json.dumps({
+                    # Send complete accumulated text to TTS for sentence-level processing
+                    if accumulated_llm_text.strip():
+                        await manager.forward_message("llm", "tts", {
                             "type": "tts_input",
-                            "text": data.get("text", ""),
+                            "text": accumulated_llm_text,
                             "partial": False,
-                        }))
+                        })
+                        logger.info(f"Sent complete LLM response to TTS: \"{accumulated_llm_text[:80]}...\"")
+                    accumulated_llm_text = ""
                     
                 elif msg_type == "user_input":
                     logger.info(f"LLM received input: \"{data.get('text', '')}\"")
