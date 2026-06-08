@@ -10,7 +10,7 @@
 #   STT_DEVICE: Device for STT model ('cpu' or 'cuda', auto-detects if not set)
 #   TTS_DEVICE: Device for TTS model ('cpu' for Intel GPU/CPU, 'cuda:0' for NVIDIA GPU)
 #   STT_MODEL: Parakeet model name (default: nvidia/parakeet-tdt-0.6b-v3)
-#   LLM_API_URL: External LLM API URL (default: http://192.168.0.118:8001/chat/completions)
+#   LLM_API_URL: External LLM API URL (default: http://192.168.0.118:8000/chat/completions)
 #   LLM_MODEL: LLM model name for API calls (default: dummy)
 
 # Parse arguments
@@ -27,7 +27,7 @@ echo "========================================"
 echo "Server: https://${HOST}:${PORT}"
 echo "STT Device: ${STT_DEVICE:-auto}"
 echo "STT Model: ${STT_MODEL:-nvidia/parakeet-tdt-0.6b-v3}"
-echo "LLM API: ${LLM_API_URL:-http://192.168.0.118:8001/chat/completions}"
+echo "LLM API: ${LLM_API_URL:-http://192.168.0.118:8000/chat/completions}"
 echo ""
 
 # Dependencies required
@@ -130,7 +130,7 @@ disown $STT_PID
 
 # Start LLM service
 echo "Starting LLM service..."
-SERVER_HOST=${HOST} SERVER_PORT=${PORT} LLM_API_URL=${LLM_API_URL:-http://192.168.0.118:8001/chat/completions} LLM_MODEL=${LLM_MODEL:-dummy} nohup .venv/bin/python LLM/llm_service.py > /tmp/jarvis_llm.log 2>&1 &
+SERVER_HOST=${HOST} SERVER_PORT=${PORT} LLM_API_URL=${LLM_API_URL:-http://192.168.0.118:8000/chat/completions} LLM_MODEL=${LLM_MODEL:-dummy} nohup .venv/bin/python LLM/llm_service.py > /tmp/jarvis_llm.log 2>&1 &
 LLM_PID=$!
 disown $LLM_PID
 sleep 2

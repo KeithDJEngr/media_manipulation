@@ -356,6 +356,7 @@ async def handle_tts(websocket, tts_processor):
                         def generate_chunks():
                             try:
                                 for chunk in tts_processor.generate_audio_chunks(text):
+                                    logger.info(f"Queuing audio: {chunk}")
                                     chunk_queue.put_nowait(chunk)
                             except Exception as e:
                                 logger.error(f"Generation error: {e}")
@@ -372,6 +373,7 @@ async def handle_tts(websocket, tts_processor):
                                     chunk["chunk_id"] = local_chunk_id
                                 local_chunk_id += 1
                                 await websocket.send(json.dumps(chunk))
+                                logger.info(f"sending audio: {chunk}")
                             except asyncio.TimeoutError:
                                 continue
 
