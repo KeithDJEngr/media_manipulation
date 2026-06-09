@@ -75,8 +75,17 @@ class QwenTTSProcessor:
         self.last_generated_text = ""
         self.last_generated_len = 0
         self.current_turn_id = None
+        self.model_path = model_path
+        self.device = device
+        self.dtype_str = dtype_str
+        self.voice_instruct = voice_instruct
+        self.language = language
+        self._model_loaded = False
+        self._load_model()
 
-        # Auto-detect device
+    def _load_model(self):
+        """Load or reload the TTS model."""
+        device = self.device
         if device == "xpu":
             try:
                 import torch.xpu
@@ -86,37 +95,50 @@ class QwenTTSProcessor:
             except Exception:
                 logger.warning("Failed to detect XPU, falling back to CPU")
                 device = "cpu"
+        self.device = device
 
-        # Load and pre-warm model
-        logger.info(f"Loading Qwen3-TTS model: {model_path} on {device}")
-        dtype = _parse_dtype(dtype_str)
+        logger.info(f"Loading Qwen3-TTS model: {self.model_path} on {device}")
+        dtype = _parse_dtype(self.dtype_str)
         if "cpu" in device:
             logger.info("oneDNN optimizations enabled by default on CPU")
-        self.model = Qwen3TTSModel.from_pretrained(
-            model_path,
-            device_map=device,
-            dtype=dtype,
-            attn_implementation="sdpa",
-        )
-        logger.info("Model loaded")
+        try:
+            self.model = Qwen3TTSModel.from_pretrained(
+                self.model_path,
+                device_map=device,
+                dtype=dtype,
+                attn_implementation="sdpa",
+            )
+            self._model_loaded = True
+            logger.info("Model loaded")
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
+            self._model_loaded = False
+            raise
 
-        self.voice_instruct = voice_instruct
-        self.language = language
-
-        # Pre-warm with a short utterance
-        logger.info("Pre-warming model...")
+    def reload_model(self):
+        """Reload the model (used after DEVICE_LOST error)."""
+        logger.info("Reloading TTS model after device error...")
+        # Free GPU memory
+        if hasattr(self, 'model') and self.model is not None:
+            del self.model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self._model_loaded = False
+        self._load_model()
+        # Re-pre-warm
+        logger.info("Pre-warming model after reload...")
         try:
             wavs, sr = self.model.generate_custom_voice(
                 text="Hello.",
-                speaker=speaker,
-                instruct=voice_instruct,
-                language=language,
+                speaker=self.speaker,
+                instruct=self.voice_instruct,
+                language=self.language,
                 non_streaming_mode=True,
                 do_sample=False,
             )
-            logger.info("Model pre-warmed")
+            logger.info("Model re-warmed")
         except Exception as e:
-            logger.warning(f"Pre-warm failed (model may still work): {e}")
+            logger.warning(f"Re-warm failed: {e}")
 
     def accumulate_text(self, text, partial=True):
         """Accumulate text from LLM tokens.
@@ -250,7 +272,59 @@ class QwenTTSProcessor:
                 }
 
         except Exception as e:
-            logger.error(f"TTS generation error: {e}")
+            error_str = str(e)
+            if "DEVICE_LOST" in error_str or "level_zero" in error_str or "device lost" in error_str.lower():
+                logger.error(f"GPU device lost error detected: {e}")
+                try:
+                    self.reload_model()
+                except Exception as reload_err:
+                    logger.error(f"Failed to reload model: {reload_err}")
+                    return
+                logger.info("Attempting regeneration after model reload...")
+                try:
+                    wavs, sr = self.model.generate_custom_voice(
+                        text=text.strip(),
+                        speaker=self.speaker,
+                        instruct=self.voice_instruct,
+                        language=self.language,
+                        non_streaming_mode=True,
+                        do_sample=True,
+                        top_p=0.9,
+                        temperature=0.7,
+                    )
+                    gen_time = _time.time() - gen_start
+                    logger.info(f"Model regeneration done in {gen_time:.1f}s, audio len={len(wavs[0])} samples")
+                except Exception as e2:
+                    logger.error(f"TTS generation error after reload: {e2}")
+                    return
+
+                if not wavs or len(wavs) == 0:
+                    logger.warning("No audio generated after reload")
+                    return
+
+                audio = wavs[0]
+                if sr != SAMPLE_RATE:
+                    logger.info(f"Resampling from {sr} to {SAMPLE_RATE}")
+                    audio = _resample(audio, sr, SAMPLE_RATE)
+
+                chunk_size = int(SAMPLE_RATE * 0.5)
+                num_samples = len(audio)
+                for start in range(0, num_samples, chunk_size):
+                    end = min(start + chunk_size, num_samples)
+                    chunk = audio[start:end]
+                    peak = np.max(np.abs(chunk))
+                    if peak > 1.0:
+                        chunk = chunk / peak
+                    audio_bytes = chunk.astype(np.float32).tobytes()
+                    audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+                    yield {
+                        "type": "audio_chunk",
+                        "audio": audio_b64,
+                        "chunk_id": start // chunk_size,
+                        "sample_rate": SAMPLE_RATE,
+                    }
+            else:
+                logger.error(f"TTS generation error: {e}")
 
     def split_into_sentences(self, text):
         """Split text into sentences using sentence boundary detection.

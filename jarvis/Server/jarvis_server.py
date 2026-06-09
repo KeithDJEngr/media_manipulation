@@ -359,7 +359,11 @@ async def handle_llm(websocket):
                     })
                     
                 elif msg_type == "llm_end":
-                    await manager.broadcast_to_client({"type": "llm_end", "turn_id": current_turn_id})
+                    await manager.broadcast_to_client({
+                        "type": "llm_end",
+                        "turn_id": current_turn_id,
+                        "text": accumulated_llm_text,
+                    })
                     # Send complete accumulated text to TTS for sentence-level processing
                     if accumulated_llm_text.strip():
                         await manager.forward_message("llm", "tts", {
@@ -423,7 +427,11 @@ async def handle_llm_service(websocket):
                     })
                     
                 elif msg_type == "llm_end":
-                    await manager.broadcast_to_client({"type": "llm_end", "turn_id": current_turn_id})
+                    await manager.broadcast_to_client({
+                        "type": "llm_end",
+                        "turn_id": current_turn_id,
+                        "text": accumulated_llm_text,
+                    })
                     # Send complete accumulated text to TTS for sentence-level processing
                     if accumulated_llm_text.strip():
                         await manager.forward_message("llm", "tts", {

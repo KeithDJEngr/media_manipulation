@@ -244,24 +244,29 @@ async def main():
             "max_tokens":LLM_MAX_TOKENS,
             }
 
-    # Connect to server
-    logger.info(f"Connecting to LLM endpoint at {service_llm_socket}")
     ssl_context = ssl.create_default_context()
     ssl_context.check_hostname = False
     ssl_context.verify_mode = ssl.CERT_NONE
 
-    try:
-        async with websockets.connect(service_llm_socket, ssl=ssl_context) as websocket:
-            await websocket.send(json.dumps({"type": "start"}))
-            logger.info("LLM connected to server")
-            await handle_llm(websocket, llm_info)
-    except ConnectionRefusedError:
-        logger.error(
-            f"Could not connect to server at {service_llm_socket}. "
-            f"Make sure the server is running on port {server_port}."
-        )
-    except Exception as e:
-        logger.error(f"Failed to connect: {e}")
+    while True:
+        try:
+            async with websockets.connect(service_llm_socket, ssl=ssl_context) as websocket:
+                await websocket.send(json.dumps({"type": "start"}))
+                logger.info("LLM connected to server")
+                await handle_llm(websocket, llm_info)
+                logger.info("LLM service handler completed, reconnecting...")
+        except websockets.ConnectionClosed as e:
+            logger.info(f"LLM connection closed: {e}, reconnecting...")
+        except ConnectionRefusedError:
+            logger.error(
+                f"Could not connect to server at {service_llm_socket}. "
+                f"Make sure the server is running on port {server_port}."
+            )
+        except Exception as e:
+            logger.error(f"Failed to connect: {e}")
+
+        logger.info(f"Reconnecting in 2 seconds...")
+        await asyncio.sleep(2)
 
 if __name__ == "__main__":
     asyncio.run(main())

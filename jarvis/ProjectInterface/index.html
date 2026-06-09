@@ -51,11 +51,11 @@
             flex: 1;
             display: flex;
             flex-direction: column;
-            overflow-y: auto;
+            overflow-y: scroll;
             padding: 16px;
             gap: 12px;
             scrollbar-width: thin;
-            scrollbar-color: #333 #111;
+            scrollbar-color: #555 #111;
         }
 
         .conversation-pane::-webkit-scrollbar {
@@ -68,12 +68,12 @@
         }
 
         .conversation-pane::-webkit-scrollbar-thumb {
-            background: #333;
+            background: #555;
             border-radius: 4px;
         }
 
         .conversation-pane::-webkit-scrollbar-thumb:hover {
-            background: #555;
+            background: #777;
         }
 
         .message-pair {
@@ -239,7 +239,8 @@
     </style>
 </head>
 <body>
-  <div class="controls-pane">
+    <div class="container">
+        <div class="controls-pane">
             <div class="controls-left">
                 <button id="start-btn">Start</button>
                 <div class="status" id="user-status">Inactive</div>
@@ -250,6 +251,7 @@
             </div>
         </div>
         <div class="conversation-pane" id="conversation-history"></div>
+    </div>
 
     <script>
         const startBtn = document.getElementById('start-btn');
@@ -656,12 +658,17 @@
                             setLLMCursor(false);
                             const textEl = llmMsgEl.querySelector('.message-text');
                             if (textEl && textEl.textContent.trim() === '') {
-                                llmMsgEl.remove();
-                                const divider = llmMsgEl.nextElementSibling;
-                                if (divider && divider.classList.contains('message-divider')) {
-                                    divider.remove();
+                                const textFromServer = data.text || '';
+                                if (textFromServer) {
+                                    textEl.textContent = textFromServer;
+                                } else {
+                                    llmMsgEl.remove();
+                                    const divider = llmMsgEl.nextElementSibling;
+                                    if (divider && divider.classList.contains('message-divider')) {
+                                        divider.remove();
+                                    }
+                                    llmMessageCount = Math.max(0, llmMessageCount - 1);
                                 }
-                                llmMessageCount = Math.max(0, llmMessageCount - 1);
                             }
                         }
                         activeLlmMessageId = null;
