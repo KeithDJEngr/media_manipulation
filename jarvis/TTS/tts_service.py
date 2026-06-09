@@ -74,6 +74,7 @@ class QwenTTSProcessor:
         self.speaker = speaker
         self.last_generated_text = ""
         self.last_generated_len = 0
+        self.current_turn_id = None
 
         # Auto-detect device
         if device == "xpu":
@@ -163,7 +164,7 @@ class QwenTTSProcessor:
             self.processed_words = 0
             self.current_chunk_text = ""
 
-    def reset_buffer(self):
+    def reset_buffer(self, turn_id=None):
         """Reset for new response."""
         self.text_buffer = ""
         self.current_chunk_text = ""
@@ -171,6 +172,7 @@ class QwenTTSProcessor:
         self.last_generated_text = ""
         self.last_generated_len = 0
         self.interrupt_event.clear()
+        self.current_turn_id = turn_id
 
     def interrupt(self):
         """Signal interruption (user started speaking again)."""
@@ -384,6 +386,9 @@ async def handle_tts(websocket, tts_processor):
             logger.error("Timeout waiting for TTS start message")
             return
 
+        # Global audio sequence counter for ordering chunks across responses
+        global_audio_seq = 0
+
         # Process incoming messages
         async for message in websocket:
             try:
@@ -397,15 +402,16 @@ async def handle_tts(websocket, tts_processor):
                 if msg_type == "tts_input":
                     text = msg.get("text", "")
                     partial = msg.get("partial", True)
+                    turn_id = msg.get("turn_id")
 
                     if not text.strip():
                         continue
 
-                    logger.info(f"TTS received text (partial={partial}): \"{text[:80]}...\"")
+                    logger.info(f"TTS received text (partial={partial}, turn_id={turn_id}): \"{text[:80]}...\"")
 
                     # Reset buffer on new complete response
                     if not partial:
-                        tts_processor.reset_buffer()
+                        tts_processor.reset_buffer(turn_id)
 
                     async def process_tts_input():
                         local_chunk_id = 0
@@ -434,11 +440,12 @@ async def handle_tts(websocket, tts_processor):
                                 chunk = await asyncio.wait_for(chunk_queue.get(), timeout=2.0)
                                 if chunk.get("interrupted"):
                                     break
-                                if local_chunk_id > 0:
-                                    chunk["chunk_id"] = local_chunk_id
-                                local_chunk_id += 1
+                                chunk["audio_seq"] = global_audio_seq
+                                global_audio_seq += 1
+                                chunk["turn_id"] = tts_processor.current_turn_id
                                 await websocket.send(json.dumps(chunk))
                                 logger.info(f"sending audio: {chunk}")
+                                local_chunk_id += 1
                             except asyncio.TimeoutError:
                                 continue
 
@@ -451,16 +458,18 @@ async def handle_tts(websocket, tts_processor):
                                 chunk = chunk_queue.get_nowait()
                                 if chunk.get("interrupted"):
                                     break
-                                if local_chunk_id > 0:
-                                    chunk["chunk_id"] = local_chunk_id
-                                local_chunk_id += 1
+                                chunk["audio_seq"] = global_audio_seq
+                                global_audio_seq += 1
+                                chunk["turn_id"] = tts_processor.current_turn_id
                                 await websocket.send(json.dumps(chunk))
+                                local_chunk_id += 1
                             except Exception:
                                 break
 
                         await websocket.send(json.dumps({
                             "type": "audio_end",
                             "total_chunks": local_chunk_id,
+                            "turn_id": tts_processor.current_turn_id,
                         }))
                         if local_chunk_id > 0:
                             logger.info(f"TTS generation complete ({local_chunk_id} chunks)")
@@ -477,6 +486,7 @@ async def handle_tts(websocket, tts_processor):
                     await websocket.send(json.dumps({
                         "type": "audio_end",
                         "interrupted": True,
+                        "turn_id": tts_processor.current_turn_id,
                     }))
                     logger.info("TTS generation stopped (interrupt)")
 

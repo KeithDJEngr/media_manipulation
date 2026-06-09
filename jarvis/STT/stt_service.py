@@ -58,6 +58,7 @@ def _detect_device(preferred):
     return "cpu"
 
 DEVICE = _detect_device(os.getenv("STT_DEVICE", "auto"))
+SAMPLE_RATE = 16000
 
 
 class ParakeetSTT:
@@ -88,6 +89,7 @@ class ParakeetSTT:
         # Audio buffer for accumulation
         self.audio_buffer = np.array([], dtype=np.float32)
         self.samples_since_last_partial = 0
+        self.max_buffer_samples = int(30 * SAMPLE_RATE)  # 30 seconds max buffer
 
     def add_audio_chunk(self, audio_bytes):
         """Add an audio chunk to the buffer.
@@ -98,6 +100,10 @@ class ParakeetSTT:
         int16_arr = np.frombuffer(audio_bytes, dtype=np.int16)
         float32_arr = int16_arr.astype(np.float32) / 32768.0
         self.audio_buffer = np.concatenate([self.audio_buffer, float32_arr])
+        if len(self.audio_buffer) > self.max_buffer_samples:
+            logger.warning(f"STT buffer exceeded {self.max_buffer_samples} samples, clearing")
+            self.audio_buffer = np.array([], dtype=np.float32)
+            self.samples_since_last_partial = 0
 
     def add_float32_chunk(self, audio_float):
         """Add a float32 audio chunk to the buffer.
@@ -106,6 +112,10 @@ class ParakeetSTT:
             audio_float: Float32 numpy array in [-1.0, 1.0]
         """
         self.audio_buffer = np.concatenate([self.audio_buffer, audio_float])
+        if len(self.audio_buffer) > self.max_buffer_samples:
+            logger.warning(f"STT buffer exceeded {self.max_buffer_samples} samples, clearing")
+            self.audio_buffer = np.array([], dtype=np.float32)
+            self.samples_since_last_partial = 0
 
     def transcribe(self):
         """Transcribe the accumulated audio buffer and clear it.
@@ -215,6 +225,8 @@ async def handle_stt(websocket, stt_service):
                             "chunk_id": chunk_id,
                         }))
                         logger.info(f"STT transcription: \"{text}\"")
+                    # Clear partial text on end of speech
+                    stt_service.clear_buffer()
 
                 elif msg_type == "partial":
                     # Partial transcription request (for streaming)
@@ -250,23 +262,30 @@ async def main():
         device=DEVICE,
     )
 
-    # Connect to server
-    logger.info(f"Connecting to STT endpoint at {stt_url}")
+    # Connect to server with reconnection
     ssl_context = ssl.create_default_context()
     ssl_context.check_hostname = False
     ssl_context.verify_mode = ssl.CERT_NONE
-    try:
-        async with websockets.connect(stt_url, ssl=ssl_context) as websocket:
-            await websocket.send(json.dumps({"type": "start"}))
-            logger.info("STT connected to server")
-            await handle_stt(websocket, stt_service)
-    except ConnectionRefusedError:
-        logger.error(
-            f"Could not connect to server at {stt_url}. "
-            f"Make sure the server is running on port {server_port}."
-        )
-    except Exception as e:
-        logger.error(f"Failed to connect: {e}")
+    
+    while True:
+        try:
+            async with websockets.connect(stt_url, ssl=ssl_context) as websocket:
+                await websocket.send(json.dumps({"type": "start"}))
+                logger.info("STT connected to server")
+                try:
+                    await handle_stt(websocket, stt_service)
+                except websockets.ConnectionClosed:
+                    logger.info("STT connection closed, reconnecting...")
+        except ConnectionRefusedError:
+            logger.error(
+                f"Could not connect to server at {stt_url}. "
+                f"Make sure the server is running on port {server_port}."
+            )
+        except Exception as e:
+            logger.error(f"STT connection error: {e}")
+        
+        logger.info("STT service reconnecting in 3 seconds...")
+        await asyncio.sleep(3)
 
 
 if __name__ == "__main__":

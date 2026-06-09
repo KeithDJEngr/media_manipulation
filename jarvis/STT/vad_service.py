@@ -92,6 +92,7 @@ class VADProcessor:
         self.is_speaking = False
         self.silence_sample_count = 0
         self.chunk_id = 0
+        self.speech_ended = False
 
         # Audio buffer for speech segments (accumulates audio during speaking)
         self.speech_buffer = []
@@ -148,6 +149,7 @@ class VADProcessor:
                 # Speech detected
                 if not self.is_speaking:
                     self.is_speaking = True
+                    self.speech_ended = False
                     messages.append(
                         {
                             "type": "vad_result",
@@ -168,6 +170,7 @@ class VADProcessor:
                 # Check if silence duration exceeds threshold
                 if self.silence_sample_count >= self.silence_threshold_samples:
                     self.is_speaking = False
+                    self.speech_ended = True
                     messages.append(
                         {
                             "type": "vad_result",
@@ -203,14 +206,15 @@ class VADProcessor:
                     )
 
             else:
-                # Silence during silence period - just ack with chunk_id
-                messages.append(
-                    {
-                        "type": "vad_result",
-                        "silence": True,
-                        "chunk_id": self.chunk_id,
-                    }
-                )
+                # Silence during silence period - only send ack if we haven't sent end-of-speech yet
+                if not self.speech_ended:
+                    messages.append(
+                        {
+                            "type": "vad_result",
+                            "silence": True,
+                            "chunk_id": self.chunk_id,
+                        }
+                    )
 
         return messages
 

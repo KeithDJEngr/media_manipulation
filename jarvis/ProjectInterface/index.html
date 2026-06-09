@@ -21,42 +21,149 @@
 
         .container {
             display: flex;
+            flex-direction: column;
             height: 100vh;
-            gap: 2px;
-            padding: 2px;
         }
 
-        .pane {
+        .controls-pane {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 20px;
+            background: #111;
+            border-bottom: 1px solid #222;
+            flex-shrink: 0;
+        }
+
+        .controls-left {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .controls-right {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .conversation-pane {
             flex: 1;
             display: flex;
             flex-direction: column;
+            overflow-y: auto;
+            padding: 16px;
+            gap: 12px;
+            scrollbar-width: thin;
+            scrollbar-color: #333 #111;
+        }
+
+        .conversation-pane::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        .conversation-pane::-webkit-scrollbar-track {
             background: #111;
-            border-radius: 8px;
-            padding: 20px;
-            overflow: hidden;
+            border-radius: 4px;
         }
 
-        .pane-header {
-            font-size: 14px;
-            text-transform: uppercase;
-            letter-spacing: 2px;
-            color: #888;
+        .conversation-pane::-webkit-scrollbar-thumb {
+            background: #333;
+            border-radius: 4px;
+        }
+
+        .conversation-pane::-webkit-scrollbar-thumb:hover {
+            background: #555;
+        }
+
+        .message-pair {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
             margin-bottom: 16px;
-            padding-bottom: 8px;
-            border-bottom: 1px solid #222;
         }
 
-        .user-pane {
+        .message-divider {
+            height: 1px;
+            background: #222;
+            margin: 4px 0;
+        }
+
+        .message-row {
+            display: flex;
+            width: 100%;
+            margin-bottom: 4px;
+        }
+
+        .message-row.user {
+            justify-content: flex-start;
+        }
+
+        .message-row.llm {
+            justify-content: flex-end;
+        }
+
+        .message-bubble {
+            max-width: 70%;
+            padding: 10px 14px;
+            border-radius: 12px;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+
+        .message-row.user .message-bubble {
             background: #1a1a2e;
+            border: 1px solid #2a2a4e;
+            border-top-left-radius: 4px;
+            color: #ccc;
         }
 
-        .llm-pane {
+        .message-row.llm .message-bubble {
             background: #1a2e1a;
+            border: 1px solid #2a4e2a;
+            border-top-right-radius: 4px;
+            color: #ccc;
+        }
+
+        .message-row.user .message-bubble {
+            background: #1a1a2e;
+            border: 1px solid #2a2a4e;
+            border-top-left-radius: 4px;
+            color: #ccc;
+        }
+
+        .message-row.llm .message-bubble {
+            background: #1a2e1a;
+            border: 1px solid #2a4e2a;
+            border-top-right-radius: 4px;
+            color: #ccc;
+        }
+
+        .message-label {
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #666;
+            margin-bottom: 4px;
+        }
+
+        .message-bubble .cursor {
+            display: inline-block;
+            width: 2px;
+            height: 1.2em;
+            background: #0af;
+            animation: blink 1s infinite;
+            vertical-align: text-bottom;
+        }
+
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0; }
         }
 
         #start-btn {
-            width: 120px;
-            height: 120px;
+            width: 80px;
+            height: 80px;
             border-radius: 50%;
             border: 3px solid #444;
             background: #222;
@@ -65,8 +172,6 @@
             font-weight: bold;
             cursor: pointer;
             transition: all 0.3s ease;
-            margin-bottom: 20px;
-            align-self: center;
         }
 
         #start-btn:hover {
@@ -89,11 +194,6 @@
             animation: pulse 1.5s infinite;
         }
 
-        @keyframes pulse {
-            0%, 100% { box-shadow: 0 0 20px rgba(0, 255, 0, 0.3); }
-            50% { box-shadow: 0 0 30px rgba(0, 255, 0, 0.6); }
-        }
-
         #start-btn.speaking {
             border-color: #0af;
             background: #0a2a3a;
@@ -102,71 +202,59 @@
             animation: pulse-blue 1.5s infinite;
         }
 
+        @keyframes pulse {
+            0%, 100% { box-shadow: 0 0 20px rgba(0, 255, 0, 0.3); }
+            50% { box-shadow: 0 0 30px rgba(0, 255, 0, 0.6); }
+        }
+
         @keyframes pulse-blue {
             0%, 100% { box-shadow: 0 0 20px rgba(0, 170, 255, 0.3); }
             50% { box-shadow: 0 0 30px rgba(0, 170, 255, 0.6); }
         }
 
-        .transcription {
-            flex: 1;
-            overflow-y: auto;
-            padding: 12px;
-            background: #0a0a0a;
+        #reset-btn {
+            padding: 8px 16px;
+            background: #333;
+            border: 1px solid #555;
+            color: #aaa;
             border-radius: 6px;
-            font-size: 16px;
-            line-height: 1.6;
-            color: #ccc;
+            font-size: 12px;
+            cursor: pointer;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            transition: all 0.2s;
         }
 
-        .transcription p {
-            margin-bottom: 12px;
-        }
-
-        .transcription .cursor {
-            display: inline-block;
-            width: 2px;
-            height: 1.2em;
-            background: #0f0;
-            animation: blink 1s infinite;
-            vertical-align: text-bottom;
-        }
-
-        .transcription .cursor-blue {
-            background: #0af;
-        }
-
-        @keyframes blink {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0; }
+        #reset-btn:hover {
+            background: #444;
+            color: #fff;
         }
 
         .status {
             font-size: 12px;
             color: #666;
-            margin-top: 8px;
+            margin-top: 4px;
             text-align: center;
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="pane user-pane">
-            <div class="pane-header">User</div>
-            <button id="start-btn">Start</button>
-            <div class="transcription" id="user-transcription"></div>
-            <div class="status" id="user-status">Inactive</div>
+  <div class="controls-pane">
+            <div class="controls-left">
+                <button id="start-btn">Start</button>
+                <div class="status" id="user-status">Inactive</div>
+            </div>
+            <div class="controls-right">
+                <div class="status" id="llm-status">Waiting</div>
+                <button id="reset-btn" onclick="resetConversation()">Reset</button>
+            </div>
         </div>
-        <div class="pane llm-pane">
-            <div class="pane-header">LLM Response</div>
-            <div class="transcription" id="llm-transcription"></div>
-            <div class="status" id="llm-status">Waiting</div>
-        </div>
-    </div>
+        <div class="conversation-pane" id="conversation-history"></div>
 
     <script>
         const startBtn = document.getElementById('start-btn');
-        const userTranscription = document.getElementById('user-transcription');
-        const llmTranscription = document.getElementById('llm-transcription');
+        const conversationHistory = document.getElementById('conversation-history');
+        const llmHistory = document.getElementById('llm-history');
         const userStatus = document.getElementById('user-status');
         const llmStatus = document.getElementById('llm-status');
 
@@ -177,91 +265,131 @@
         let ws = null;
         let audioSinkId = null;
 
-        // Audio playback
+        // Audio playback with ordering
         let audioQueue = [];
         let isPlaying = false;
         let currentAudioBuffer = null;
-        let audioSource = null;
         let audioContextForPlayback = null;
+        let expectedNextSeq = 0;
+        let pendingAudioBuffers = [];
+        let currentMessageSeq = 0;
+        let currentTurnId = 0;
+        let previousTurnId = 0;
 
-        // WebSocket connections - use current host to work from any hostname
+        // WebSocket connections
         const origin = window.location.origin.replace(/^http/, 'ws');
         const VAD_WS_URL = `${origin}/vad`;
         const TTS_WS_URL = `${origin}/tts`;
 
-        // User state
+        // Conversation tracking
         let userMessageCount = 0;
         let llmMessageCount = 0;
+        let currentPartialText = '';
+        let currentPartialSeq = -1;
+        let isLLMResponding = false;
+        let lastUserMessageId = null;
+        let activeLlmMessageId = null;
 
-         function appendUserTranscription(text) {
-            if (userMessageCount === 0) {
-                userTranscription.innerHTML = '';
+        function appendUserMessage(text) {
+            const row = document.createElement('div');
+            row.className = 'message-row user';
+            row.id = `user-msg-${userMessageCount}`;
+            row.innerHTML = `<div class="message-bubble"><div class="message-label">User</div><div class="message-text">${escapeHtml(text)}</div></div>`;
+            conversationHistory.appendChild(row);
+            conversationHistory.scrollTop = conversationHistory.scrollHeight;
+        }
+
+        function appendLLMMessage(text) {
+            llmMessageCount++;
+            const row = document.createElement('div');
+            row.className = 'message-row llm';
+            row.id = `llm-msg-${llmMessageCount}`;
+            activeLlmMessageId = row.id;
+            row.innerHTML = `<div class="message-bubble"><div class="message-label">LLM</div><div class="message-text">${escapeHtml(text)}</div></div>`;
+            conversationHistory.appendChild(row);
+            const divider = document.createElement('div');
+            divider.className = 'message-divider';
+            conversationHistory.appendChild(divider);
+            conversationHistory.scrollTop = conversationHistory.scrollHeight;
+        }
+
+        function updateUserMessage(seq, text) {
+            if (!lastUserMessageId) {
+                userMessageCount++;
+                const row = document.createElement('div');
+                row.className = 'message-row user';
+                row.id = `user-msg-${userMessageCount}`;
+                row.innerHTML = `<div class="message-bubble"><div class="message-label">User</div><div class="message-text">${escapeHtml(text)}</div></div>`;
+                conversationHistory.appendChild(row);
+                lastUserMessageId = `user-msg-${userMessageCount}`;
+            } else {
+                const msgEl = document.getElementById(lastUserMessageId);
+                if (msgEl) {
+                    const textEl = msgEl.querySelector('.message-text');
+                    textEl.textContent = text;
+                }
             }
-            let msgEl = userTranscription.querySelector(`#user-msg-${userMessageCount}`);
+            conversationHistory.scrollTop = conversationHistory.scrollHeight;
+        }
+
+        function finalizeUserMessage() {
+            lastUserMessageId = null;
+        }
+
+        function updateLLMStreaming(seq, text) {
+            let msgEl = null;
+            if (activeLlmMessageId) {
+                msgEl = document.getElementById(activeLlmMessageId);
+            }
             if (!msgEl) {
-                msgEl = document.createElement('p');
-                msgEl.id = `user-msg-${userMessageCount}`;
-                userTranscription.appendChild(msgEl);
+                appendLLMMessage(text);
+                setLLMCursor(true);
+                return;
             }
-            msgEl.textContent = text;
-            userTranscription.scrollTop = userTranscription.scrollHeight;
+            const textEl = msgEl.querySelector('.message-text');
+            textEl.textContent = text;
+            conversationHistory.scrollTop = conversationHistory.scrollHeight;
         }
 
-        function updateUserTranscription(text) {
-            let msgEl = userTranscription.querySelector(`#user-msg-${userMessageCount}`);
-            if (!msgEl) {
-                msgEl = document.createElement('p');
-                msgEl.id = `user-msg-${userMessageCount}`;
-                userTranscription.appendChild(msgEl);
-            }
-            msgEl.textContent = text;
-            userTranscription.scrollTop = userTranscription.scrollHeight;
+        function createMessageRow(className, id, labelText, text) {
+            const row = document.createElement('div');
+            row.className = className;
+            row.id = id;
+            row.innerHTML = `<div class="message-bubble"><div class="message-label">${labelText}</div><div class="message-text">${escapeHtml(text)}</div></div>`;
+            conversationHistory.appendChild(row);
+            conversationHistory.scrollTop = conversationHistory.scrollHeight;
+            return row;
         }
 
-        function clearUserTranscription() {
-            userTranscription.innerHTML = '';
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
         }
 
-        function appendLLMTranscription(text) {
-            if (llmMessageCount === 0) {
-                llmTranscription.innerHTML = '';
-            }
-            const p = document.createElement('p');
-            p.id = `llm-msg-${llmMessageCount}`;
-            p.textContent = text;
-            llmTranscription.appendChild(p);
-            llmTranscription.scrollTop = llmTranscription.scrollHeight;
+        function clearHistory() {
+            conversationHistory.innerHTML = '';
+            if (llmHistory) llmHistory.innerHTML = '';
+            activeLlmMessageId = null;
+            lastUserMessageId = null;
         }
 
-        function updateLLMTranscriptionStreaming(text) {
-            let msgEl = llmTranscription.querySelector(`#llm-msg-${llmMessageCount}`);
-            if (!msgEl) {
-                msgEl = document.createElement('p');
-                msgEl.id = `llm-msg-${llmMessageCount}`;
-                llmTranscription.appendChild(msgEl);
-            }
-            msgEl.textContent = text;
-            llmTranscription.scrollTop = llmTranscription.scrollHeight;
+        function clearPendingAudioBuffers() {
+            pendingAudioBuffers = [];
+            expectedNextSeq = 0;
+            currentTurnId = 0;
         }
 
-        function clearLLMTranscription() {
-            llmTranscription.innerHTML = '';
-        }
-
-        function setLLMCursor(show) {
-            let cursor = llmTranscription.querySelector('.cursor');
+       function setLLMCursor(show) {
+            const currentMsg = document.getElementById(`llm-msg-${llmMessageCount}`);
+            let cursor = currentMsg?.querySelector('.cursor');
             if (show) {
-                if (!cursor) {
+                if (currentMsg && !cursor) {
                     cursor = document.createElement('span');
-                    cursor.className = 'cursor cursor-blue';
-                    let msgEl = llmTranscription.querySelector(`#llm-msg-${llmMessageCount}`);
-                    if (msgEl) {
-                        msgEl.appendChild(cursor);
-                    } else {
-                        const p = document.createElement('p');
-                        p.id = `llm-msg-${llmMessageCount}`;
-                        p.appendChild(cursor);
-                        llmTranscription.appendChild(p);
+                    cursor.className = 'cursor';
+                    const textEl = currentMsg.querySelector('.message-text');
+                    if (textEl) {
+                        textEl.appendChild(cursor);
                     }
                 }
             } else if (cursor) {
@@ -272,7 +400,7 @@
         // Audio capture
         async function startAudioCapture() {
             if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-                alert('Microphone not supported in this browser. Please use http://localhost:8765/ or https:// and a modern browser (Chrome, Firefox, Edge).');
+                alert('Microphone not supported in this browser.');
                 return;
             }
             try {
@@ -327,14 +455,16 @@
             }
         }
 
-        // Audio playback
+        // Audio playback with sequence-based ordering
         function initPlaybackContext() {
             if (!audioContextForPlayback) {
                 audioContextForPlayback = new (window.AudioContext || window.webkitAudioContext)();
             }
         }
 
-        function playAudioChunk(base64Data) {
+        function enqueueAudioChunk(base64Data, seq) {
+            if (!base64Data) return;
+            
             initPlaybackContext();
             if (audioContextForPlayback.state === 'suspended') {
                 audioContextForPlayback.resume();
@@ -350,8 +480,24 @@
             const buffer = audioContextForPlayback.createBuffer(1, samples.length, 16000);
             buffer.getChannelData(0).set(samples);
 
-            audioQueue.push(buffer);
-            if (!isPlaying) {
+            pendingAudioBuffers.push({ buffer, seq });
+            sortAndPlayPending();
+        }
+
+        function sortAndPlayPending() {
+            if (pendingAudioBuffers.length === 0) {
+                return;
+            }
+
+            pendingAudioBuffers.sort((a, b) => a.seq - b.seq);
+
+            while (pendingAudioBuffers.length > 0 && pendingAudioBuffers[0].seq === expectedNextSeq) {
+                const item = pendingAudioBuffers.shift();
+                audioQueue.push(item.buffer);
+                expectedNextSeq++;
+            }
+
+            if (!isPlaying && audioQueue.length > 0) {
                 playNextBuffer();
             }
         }
@@ -391,10 +537,33 @@
                 audioSource = null;
             }
             audioQueue = [];
+            pendingAudioBuffers = [];
             currentAudioBuffer = null;
             isPlaying = false;
+            expectedNextSeq = 0;
+            currentTurnId = 0;
+            previousTurnId = 0;
             llmStatus.textContent = 'Idle';
             startBtn.classList.remove('speaking');
+        }
+
+      function resetConversation() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'reset' }));
+            }
+            llmMessageCount = 0;
+            userMessageCount = 0;
+            currentPartialText = '';
+            currentPartialSeq = -1;
+            clearHistory();
+            stopPlayback();
+            llmStatus.textContent = 'Waiting';
+            setLLMCursor(false);
+            isLLMResponding = false;
+            currentTurnId = 0;
+            previousTurnId = 0;
+            activeLlmMessageId = null;
+            lastUserMessageId = null;
         }
 
         // WebSocket connections
@@ -408,54 +577,121 @@
             ws.onmessage = (event) => {
                 const data = JSON.parse(event.data);
 
-                 switch (data.type) {
+                switch (data.type) {
                     case 'user_transcript':
                     case 'user_partial':
-                        if (data.type === 'user_partial' && userMessageCount === 0) {
-                            userMessageCount++;
+                        if (data.type === 'user_partial') {
+                            currentPartialText = data.text;
+                            updateUserMessage(data.chunk_id || 0, data.text);
+                        } else {
+                            updateUserMessage(data.chunk_id || 0, data.text);
+                            finalizeUserMessage();
+                            currentPartialText = '';
                         }
-                        appendUserTranscription(data.text);
                         break;
 
-                    case 'llm_transcript':
+                   case 'llm_transcript':
                         if (data.final) {
-                            llmMessageCount++;
+                            appendLLMMessage(data.text);
                             setLLMCursor(false);
-                        } else {
-                            setLLMCursor(true);
-                            updateLLMTranscriptionStreaming(data.text);
+                            isLLMResponding = false;
+                        } else if (data.partial) {
+                            updateLLMStreaming(data.turn_id !== undefined ? data.turn_id : -1, data.text);
+                            isLLMResponding = true;
                         }
                         break;
 
                     case 'llm_audio':
-                        playAudioChunk(data.audio);
+                        if (data.turn_id !== undefined) {
+                            if (data.turn_id !== previousTurnId && data.turn_id !== currentTurnId + 1) {
+                                clearPendingAudioBuffers();
+                                previousTurnId = currentTurnId;
+                            }
+                            currentTurnId = data.turn_id;
+                        }
+                        const audioSeq = data.audio_seq !== undefined ? data.audio_seq : expectedNextSeq;
+                        enqueueAudioChunk(data.audio, audioSeq);
                         break;
 
                     case 'user_start':
                         userStatus.textContent = 'Listening...';
                         userMessageCount = 0;
-                        clearUserTranscription();
+                        llmMessageCount = 0;
+                        currentPartialText = '';
+                        currentPartialSeq = -1;
+                        clearHistory();
                         break;
 
                     case 'user_end':
                         userStatus.textContent = 'Processing...';
                         break;
 
-                    case 'llm_start':
+                     case 'llm_start':
+                        currentTurnId = data.turn_id || 0;
+                        previousTurnId = 0;
                         llmMessageCount = 0;
-                        clearLLMTranscription();
-                        setLLMCursor(true);
+                        clearPendingAudioBuffers();
+                        if (activeLlmMessageId) {
+                            const oldMsg = document.getElementById(activeLlmMessageId);
+                            if (oldMsg) {
+                                oldMsg.remove();
+                            }
+                            const oldDivider = oldMsg?.nextElementSibling;
+                            if (oldDivider && oldDivider.classList.contains('message-divider')) {
+                                oldDivider.remove();
+                            }
+                            activeLlmMessageId = null;
+                        }
                         llmStatus.textContent = 'Thinking...';
+                        isLLMResponding = true;
                         break;
 
                     case 'llm_end':
                         llmStatus.textContent = 'Idle';
+                        if (data.turn_id) {
+                            previousTurnId = data.turn_id;
+                        }
+                        const llmMsgEl = activeLlmMessageId ? document.getElementById(activeLlmMessageId) : null;
+                        if (llmMsgEl) {
+                            setLLMCursor(false);
+                            const textEl = llmMsgEl.querySelector('.message-text');
+                            if (textEl && textEl.textContent.trim() === '') {
+                                llmMsgEl.remove();
+                                const divider = llmMsgEl.nextElementSibling;
+                                if (divider && divider.classList.contains('message-divider')) {
+                                    divider.remove();
+                                }
+                                llmMessageCount = Math.max(0, llmMessageCount - 1);
+                            }
+                        }
+                        activeLlmMessageId = null;
                         break;
 
                     case 'interrupt':
                         stopPlayback();
-                        clearLLMTranscription();
+                        currentPartialText = '';
+                        isLLMResponding = false;
+                        currentTurnId = 0;
+                        previousTurnId = 0;
+                        break;
+
+                    case 'audio_complete':
+                        if (data.turn_id) {
+                            previousTurnId = data.turn_id;
+                        }
+                        break;
+
+                    case 'reset_complete':
                         llmMessageCount = 0;
+                        userMessageCount = 0;
+                        currentPartialText = '';
+                        currentPartialSeq = -1;
+                        clearHistory();
+                        stopPlayback();
+                        setLLMCursor(false);
+                        isLLMResponding = false;
+                        currentTurnId = 0;
+                        previousTurnId = 0;
                         break;
                 }
             };
@@ -476,13 +712,13 @@
             if (!isRunning) {
                 isRunning = true;
                 startBtn.textContent = 'Stop';
-                startBtn.classList.add('active');
+                startBtn.classList.add('active', 'listening');
                 userStatus.textContent = 'Starting...';
                 llmStatus.textContent = 'Waiting';
 
                 await startAudioCapture();
                 connectVAD();
-            } else {
+                 } else {
                 isRunning = false;
                 startBtn.textContent = 'Start';
                 startBtn.classList.remove('active', 'listening', 'speaking');
@@ -492,10 +728,20 @@
                 stopAudioCapture();
                 stopPlayback();
 
-                if (ws) {
-                    ws.close();
-                    ws = null;
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'stop' }));
+                    ws.send(JSON.stringify({ type: 'interrupt' }));
                 }
+                
+                llmMessageCount = 0;
+                userMessageCount = 0;
+                currentPartialText = '';
+                currentPartialSeq = -1;
+                clearHistory();
+                setLLMCursor(false);
+                isLLMResponding = false;
+                currentTurnId = 0;
+                previousTurnId = 0;
             }
         });
     </script>
