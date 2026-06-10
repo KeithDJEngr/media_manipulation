@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 # Basic setup
 LLM_API_URL = os.getenv("LLM_API_URL", "http://192.168.0.121:8000/chat/completions")
 LLM_MODEL = os.getenv("LLM_MODEL", "Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf")
-LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.9"))
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2048"))
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.7"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1024"))
 
 # System prompt for the LLM
 SYSTEM_PROMPT = os.getenv(

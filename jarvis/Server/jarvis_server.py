@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).parent.parent
 HTML_FILE = BASE_DIR / "ProjectInterface" / "index.html"
+STATIC_DIR = BASE_DIR / "ProjectInterface"
 
 class ConnectionManager:
     """Manages all WebSocket connections and message routing."""
@@ -131,21 +132,22 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 def serve_html_file(connection, request, html_file):
-    """Serve HTML file for HTTP requests to /."""
+    """Serve HTML file for HTTP requests to / and static files from ProjectInterface."""
+    content_types = {
+        ".html": "text/html; charset=utf-8",
+        ".css": "text/css",
+        ".js": "application/javascript",
+        ".mjs": "application/javascript",
+        ".json": "application/json",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".gif": "image/gif",
+        ".svg": "image/svg+xml",
+        ".ico": "image/x-icon",
+        ".webp": "image/webp",
+    }
+
     if request.path == "/":
-        content_types = {
-            ".html": "text/html; charset=utf-8",
-            ".css": "text/css",
-            ".js": "application/javascript",
-            ".mjs": "application/javascript",
-            ".json": "application/json",
-            ".png": "image/png",
-            ".jpg": "image/jpeg",
-            ".gif": "image/gif",
-            ".svg": "image/svg+xml",
-            ".ico": "image/x-icon",
-            ".webp": "image/webp",
-        }
         if html_file.exists():
             content_type = content_types.get(html_file.suffix, "application/octet-stream")
             content = html_file.read_bytes()
@@ -157,6 +159,22 @@ def serve_html_file(connection, request, html_file):
                 headers=headers,
                 body=content,
             )
+        return None
+
+    if request.path.startswith("/") and not request.path.startswith("/vad") and not request.path.startswith("/stt") and not request.path.startswith("/llm") and not request.path.startswith("/tts") and not request.path.startswith("/llm_service"):
+        static_file = STATIC_DIR / request.path.lstrip("/")
+        if static_file.exists() and static_file.is_file():
+            content_type = content_types.get(static_file.suffix, "application/octet-stream")
+            content = static_file.read_bytes()
+            headers = Headers()
+            headers["Content-Type"] = content_type
+            return Response(
+                status_code=HTTPStatus.OK,
+                reason_phrase="OK",
+                headers=headers,
+                body=content,
+            )
+
     return None
 
 async def handle_client(websocket):
