@@ -92,6 +92,8 @@ async def handle_llm(websocket, llm_info):
                             conversation_history.extend(new_history)
 
                     # Send start signal
+                    # TODO: llm_start only appears to be sent once and then stays at 0 for llmMessageCount. Need to resolve.
+                    logger.info("sending llm_start")
                     await websocket.send(json.dumps({"type": "llm_start"}))
                     
                     last_token = None

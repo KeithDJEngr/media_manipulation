@@ -37,23 +37,40 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Device preference: use CUDA if available, XPU (Intel GPU) next, fall back to CPU
+def _xpu_is_available():
+    if not hasattr(torch, "xpu"):
+        return False
+    orig_mask = os.environ.get("ZE_AFFINITY_MASK")
+    # Level Zero fails with multiple Intel GPUs; restrict to GPU 0
+    os.environ["ZE_AFFINITY_MASK"] = "0"
+    try:
+        return torch.xpu.is_available()
+    except RuntimeError:
+        return False
+    finally:
+        if orig_mask is not None:
+            os.environ["ZE_AFFINITY_MASK"] = orig_mask
+        else:
+            os.environ.pop("ZE_AFFINITY_MASK", None)
+
+
 def _detect_device(preferred):
     if preferred in ("auto", None, ""):
         if torch.cuda.is_available():
             return "cuda"
-        if hasattr(torch, "xpu") and torch.xpu.is_available():
+        if _xpu_is_available():
             return "xpu"
         return "cpu"
     if preferred == "cuda" and torch.cuda.is_available():
         return "cuda"
-    if preferred == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
+    if preferred == "xpu" and _xpu_is_available():
         return "xpu"
     if preferred == "cpu":
         return "cpu"
     # Unrecognized device name — fall back to first available
     if torch.cuda.is_available():
         return "cuda"
-    if hasattr(torch, "xpu") and torch.xpu.is_available():
+    if _xpu_is_available():
         return "xpu"
     return "cpu"
 
