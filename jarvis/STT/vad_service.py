@@ -76,17 +76,29 @@ class VADProcessor:
     WINDOW_SIZE = 512
     SAMPLE_RATE = 16000
 
-    def __init__(self, model, threshold=0.5, silence_threshold_samples=1600):
+    def __init__(self, model, threshold=0.5, silence_threshold_samples=1600, silence_threshold_samples_grace=4000):
         """
         Args:
             model: Silero VAD ONNX model
             threshold: Speech probability threshold (0.0-1.0)
             silence_threshold_samples: Number of silent samples before declaring end of speech
                                        (1600 samples = 100ms at 16kHz)
+            silence_threshold_samples_grace: Silent samples at start before silence counting begins
+                                             (~250ms grace period for VAD state warmup)
         """
         self.model = model
         self.threshold = threshold
         self.silence_threshold_samples = silence_threshold_samples
+        self.silence_threshold_samples_grace = silence_threshold_samples_grace
+
+        logger.info(f"Starting the vad with: ")
+        logger.info(f"  WINDOW_SIZE: {self.WINDOW_SIZE}")
+        logger.info(f"  SAMPLE_RATE: {self.SAMPLE_RATE}")
+        logger.info(f"  THRESHOLD: {self.threshold}")
+        logger.info(f"  SILENCE_THRESHOLD: {self.silence_threshold_samples}")
+        logger.info(f"  SILENCE_GRACE: {self.silence_threshold_samples_grace}")
+        logger.info(f"  Resulting silence gap for speach end: {self.silence_threshold_samples/self.SAMPLE_RATE} sec")
+
 
         # State tracking
         self.is_speaking = False
@@ -207,6 +219,11 @@ class VADProcessor:
 
             else:
                 # Silence during silence period - only send ack if we haven't sent end-of-speech yet
+                if self.silence_sample_count < self.silence_threshold_samples_grace:
+                    self.silence_sample_count += self.WINDOW_SIZE
+                else:
+                    self.silence_sample_count = self.silence_threshold_samples_grace
+
                 if not self.speech_ended:
                     messages.append(
                         {
@@ -217,6 +234,19 @@ class VADProcessor:
                     )
 
         return messages
+
+    @staticmethod
+    def warmup(model, window_size=512, sample_rate=16000, num_frames=10):
+        """Prime the Silero VAD model's hidden states with silence frames.
+        
+        Silero VAD uses an LSTM internally. The hidden states start at zero,
+        making the first few predictions unreliable. Warmup ensures the model
+        is ready for the first real audio chunk.
+        """
+        silence = np.zeros(window_size, dtype=np.float32)
+        for _ in range(num_frames):
+            tensor = torch.from_numpy(silence)
+            model(tensor, sample_rate)
 
     @staticmethod
     def float32_to_int16_bytes(audio):
@@ -231,6 +261,16 @@ async def handle_vad_connection(websocket, vad_processor):
     # Send start immediately to signal VAD is ready
     await websocket.send(json.dumps({"type": "start"}))
     logger.info("VAD connected to server, started sending audio")
+
+    async def send_heartbeats():
+        while True:
+            await asyncio.sleep(5)
+            try:
+                await websocket.send(json.dumps({"type": "heartbeat"}))
+            except Exception:
+                break
+
+    heartbeat_task = asyncio.create_task(send_heartbeats())
 
     try:
         async for message in websocket:
@@ -273,6 +313,12 @@ async def handle_vad_connection(websocket, vad_processor):
         logger.info(f"VAD connection closed: {e}")
     except Exception as e:
         logger.error(f"VAD connection error: {e}")
+    finally:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
 
 
 async def main():
@@ -285,23 +331,46 @@ async def main():
     model = await load_vad_model()
 
     # Create VAD processor with tuned parameters
-    vad_processor = VADProcessor(model, threshold=0.5, silence_threshold_samples=3200)
+    vad_processor = VADProcessor(model, threshold=0.6, silence_threshold_samples=9000, silence_threshold_samples_grace=4000)
+
+    # Prime the VAD model's hidden states so the first audio predictions are reliable
+    VADProcessor.warmup(model)
+    logger.info("VAD model warmed up")
 
     # Connect to the server
     logger.info(f"Connecting to server at {vad_url}")
     ssl_context = ssl.create_default_context()
     ssl_context.check_hostname = False
     ssl_context.verify_mode = ssl.CERT_NONE
-    try:
-        async with websockets.connect(vad_url, ssl=ssl_context) as websocket:
-            await handle_vad_connection(websocket, vad_processor)
-    except ConnectionRefusedError:
-        logger.error(
-            f"Could not connect to server at {vad_url}. "
-            "Make sure the server is running on port {server_port}."
-        )
-    except Exception as e:
-        logger.error(f"Failed to connect: {e}")
+    while True:
+        try:
+            async with websockets.connect(vad_url, ssl=ssl_context) as websocket:
+                await websocket.send(json.dumps({"type": "start"}))
+                await websocket.send(json.dumps({
+                    "type": "service_status",
+                    "service": "vad",
+                    "status": "connected",
+                }))
+                logger.info("VAD connected to server")
+                await handle_vad_connection(websocket, vad_processor)
+                await websocket.send(json.dumps({
+                    "type": "service_status",
+                    "service": "vad",
+                    "status": "disconnected",
+                }))
+        except websockets.ConnectionClosed:
+            logger.info("VAD connection closed, reconnecting...")
+        except ConnectionRefusedError:
+            logger.error(
+                f"Could not connect to server at {vad_url}. "
+                "Make sure the server is running on port {server_port}."
+            )
+            await asyncio.sleep(3)
+            continue
+        except Exception as e:
+            logger.error(f"Failed to connect: {e}")
+            await asyncio.sleep(3)
+            continue
 
 
 if __name__ == "__main__":

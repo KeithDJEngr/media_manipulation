@@ -24,11 +24,20 @@ import os
 import re
 import ssl
 
+# Guard Level Zero GPU enumeration before torch import (same fix as STT service)
+_ze_mask_before = os.environ.get("ZE_AFFINITY_MASK")
+os.environ["ZE_AFFINITY_MASK"] = "0"
+
 import numpy as np
 import torch
 import websockets
 import soundfile as sf
 from qwen_tts import Qwen3TTSModel
+
+if _ze_mask_before is not None:
+    os.environ["ZE_AFFINITY_MASK"] = _ze_mask_before
+else:
+    os.environ.pop("ZE_AFFINITY_MASK", None)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -445,6 +454,16 @@ def _resample(audio, from_sr, to_sr):
 
 async def handle_tts(websocket, tts_processor):
     """Handle the TTS WebSocket connection."""
+    async def send_heartbeats():
+        while True:
+            await asyncio.sleep(5)
+            try:
+                await websocket.send(json.dumps({"type": "heartbeat"}))
+            except Exception:
+                break
+
+    heartbeat_task = asyncio.create_task(send_heartbeats())
+    
     try:
         # Wait for client message
         try:
@@ -579,6 +598,12 @@ async def handle_tts(websocket, tts_processor):
         logger.info(f"TTS connection closed: {e}")
     except Exception as e:
         logger.error(f"TTS connection error: {e}")
+    finally:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
 
 
 async def main():
@@ -602,18 +627,35 @@ async def main():
     ssl_context = ssl.create_default_context()
     ssl_context.check_hostname = False
     ssl_context.verify_mode = ssl.CERT_NONE
-    try:
-        async with websockets.connect(tts_url, ssl=ssl_context) as websocket:
-            await websocket.send(json.dumps({"type": "start"}))
-            logger.info("TTS connected to server")
-            await handle_tts(websocket, tts_processor)
-    except ConnectionRefusedError:
-        logger.error(
-            f"Could not connect to server at {tts_url}. "
-            f"Make sure the server is running on port {server_port}."
-        )
-    except Exception as e:
-        logger.error(f"Failed to connect: {e}")
+    while True:
+        try:
+            async with websockets.connect(tts_url, ssl=ssl_context) as websocket:
+                await websocket.send(json.dumps({"type": "start"}))
+                await websocket.send(json.dumps({
+                    "type": "service_status",
+                    "service": "tts",
+                    "status": "connected",
+                }))
+                logger.info("TTS connected to server")
+                await handle_tts(websocket, tts_processor)
+                await websocket.send(json.dumps({
+                    "type": "service_status",
+                    "service": "tts",
+                    "status": "disconnected",
+                }))
+        except websockets.ConnectionClosed:
+            logger.info("TTS connection closed, reconnecting...")
+        except ConnectionRefusedError:
+            logger.error(
+                f"Could not connect to server at {tts_url}. "
+                f"Make sure the server is running on port {server_port}."
+            )
+            await asyncio.sleep(3)
+            continue
+        except Exception as e:
+            logger.error(f"Failed to connect: {e}")
+            await asyncio.sleep(3)
+            continue
 
 
 if __name__ == "__main__":

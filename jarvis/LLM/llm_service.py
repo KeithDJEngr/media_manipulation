@@ -52,9 +52,24 @@ async def handle_llm(websocket, llm_info):
         {"role": "system", "content": SYSTEM_PROMPT}
     ]
 
+    async def send_heartbeats():
+        while True:
+            await asyncio.sleep(5)
+            try:
+                await websocket.send(json.dumps({"type": "heartbeat"}))
+            except Exception:
+                break
+
+    heartbeat_task = asyncio.create_task(send_heartbeats())
+    
     try:
         # Signal ready immediately
         await websocket.send(json.dumps({"type": "start"}))
+        await websocket.send(json.dumps({
+            "type": "service_status",
+            "service": "llm",
+            "status": "connected",
+        }))
         logger.info("LLM service ready")
 
         # Process incoming messages
@@ -229,9 +244,37 @@ async def handle_llm(websocket, llm_info):
                 raise
 
     except websockets.ConnectionClosed as e:
-        logger.info(f"LLM connection closed: {e}")
+        reason = getattr(e, 'reason', str(e)) if hasattr(e, 'reason') else str(e)
+        # Only send status if we're still connected
+        try:
+            await websocket.send(json.dumps({
+                "type": "service_status",
+                "service": "llm",
+                "status": "disconnected",
+            }))
+        except Exception:
+            pass
+        if "1011" in reason or "keepalive" in reason.lower():
+            logger.info(f"LLM connection closed (ping timeout): {reason}")
+        else:
+            logger.info(f"LLM connection closed: {reason}")
     except Exception as e:
         logger.error(f"LLM connection error: {e}")
+        try:
+            await websocket.send(json.dumps({
+                "type": "service_status",
+                "service": "llm",
+                "status": "error",
+                "error": str(e)[:100],
+            }))
+        except Exception:
+            pass
+    finally:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
 
 async def main():
     server_host = os.getenv("SERVER_HOST", "127.0.0.1")
@@ -254,11 +297,25 @@ async def main():
         try:
             async with websockets.connect(service_llm_socket, ssl=ssl_context) as websocket:
                 await websocket.send(json.dumps({"type": "start"}))
+                await websocket.send(json.dumps({
+                    "type": "service_status",
+                    "service": "llm",
+                    "status": "connected",
+                }))
                 logger.info("LLM connected to server")
                 await handle_llm(websocket, llm_info)
                 logger.info("LLM service handler completed, reconnecting...")
         except websockets.ConnectionClosed as e:
             logger.info(f"LLM connection closed: {e}, reconnecting...")
+            try:
+                async with websockets.connect(service_llm_socket, ssl=ssl_context) as ws:
+                    await ws.send(json.dumps({
+                        "type": "service_status",
+                        "service": "llm",
+                        "status": "disconnected",
+                    }))
+            except Exception:
+                pass
         except ConnectionRefusedError:
             logger.error(
                 f"Could not connect to server at {service_llm_socket}. "

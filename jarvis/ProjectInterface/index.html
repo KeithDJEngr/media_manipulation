@@ -18,10 +18,62 @@
                 <button id="reset-btn" onclick="resetConversation()">Reset</button>
             </div>
         </div>
+        <div class="service-status-bar">
+            <div class="service-status-item" id="status-vad" title="Voice Activity Detection">
+                <span class="service-dot" id="dot-vad"></span>
+                <span class="service-label">VAD</span>
+            </div>
+            <div class="service-status-item" id="status-stt" title="Speech-to-Text">
+                <span class="service-dot" id="dot-stt"></span>
+                <span class="service-label">STT</span>
+            </div>
+            <div class="service-status-item" id="status-llm" title="Language Model">
+                <span class="service-dot" id="dot-llm"></span>
+                <span class="service-label">LLM</span>
+            </div>
+            <div class="service-status-item" id="status-tts" title="Text-to-Speech">
+                <span class="service-dot" id="dot-tts"></span>
+                <span class="service-label">TTS</span>
+            </div>
+            <div class="service-status-item" id="status-websocket" title="Web Connection">
+                <span class="service-dot" id="dot-websocket"></span>
+                <span class="service-label">Web</span>
+            </div>
+        </div>
         <div class="conversation-pane" id="conversation-history"></div>
     </div>
 
     <script>
+        const HEARTBEAT_TIMEOUT = 15000;
+        const serviceHeartbeatTimers = { vad: null, stt: null, llm: null, tts: null };
+        const serviceLastHeartbeat = { vad: 0, stt: 0, llm: 0, tts: 0 };
+
+        function resetServiceHeartbeat(svc) {
+            if (!serviceLastHeartbeat[svc]) return;
+            if (serviceHeartbeatTimers[svc]) {
+                clearTimeout(serviceHeartbeatTimers[svc]);
+                serviceHeartbeatTimers[svc] = null;
+            }
+            serviceLastHeartbeat[svc] = Date.now();
+        }
+
+        function startServiceHeartbeatTimeout(svc) {
+            if (!serviceLastHeartbeat[svc]) {
+                serviceLastHeartbeat[svc] = Date.now();
+            }
+            if (serviceHeartbeatTimers[svc]) {
+                clearTimeout(serviceHeartbeatTimers[svc]);
+            }
+            serviceHeartbeatTimers[svc] = setTimeout(() => {
+                const dot = document.getElementById(`dot-${svc}`);
+                if (dot && dot.classList.contains('active')) {
+                    dot.className = 'service-dot offline';
+                    console.log(`Service ${svc} heartbeat timeout, marking offline`);
+                }
+                serviceHeartbeatTimers[svc] = null;
+            }, HEARTBEAT_TIMEOUT);
+        }
+
         const startBtn = document.getElementById('start-btn');
         const conversationHistory = document.getElementById('conversation-history');
         const llmHistory = document.getElementById('llm-history');
@@ -84,7 +136,11 @@
         }
 
         function updateUserMessage(seq, text) {
-            if (!lastUserMessageId) {
+            let msgEl = null;
+            if (lastUserMessageId) {
+                msgEl = document.getElementById(lastUserMessageId);
+            }
+            if (!msgEl) {
                 userMessageCount++;
                 const row = document.createElement('div');
                 row.className = 'message-row user';
@@ -92,13 +148,10 @@
                 row.innerHTML = `<div class="message-bubble"><div class="message-label">User</div><div class="message-text">${escapeHtml(text)}</div></div>`;
                 conversationHistory.appendChild(row);
                 lastUserMessageId = `user-msg-${userMessageCount}`;
-            } else {
-                const msgEl = document.getElementById(lastUserMessageId);
-                if (msgEl) {
-                    const textEl = msgEl.querySelector('.message-text');
-                    textEl.textContent = text;
-                }
+                msgEl = row;
             }
+            const textEl = msgEl.querySelector('.message-text');
+            textEl.textContent = text;
             conversationHistory.scrollTop = conversationHistory.scrollHeight;
         }
 
@@ -111,7 +164,18 @@
             if (activeLlmMessageId) {
                 msgEl = document.getElementById(activeLlmMessageId);
             }
+            const llmMsgs = Array.from(conversationHistory.querySelectorAll('.message-row.llm')).map(el => ({
+                id: el.id,
+                text: el.querySelector('.message-text')?.textContent?.substring(0, 50) || '(empty)'
+            }));
+            console.log('[LLM-STREAM] updateLLMStreaming:', { 
+                activeLlmMessageId, msgEl: msgEl ? msgEl.id : 'null', 
+                llmMessageCount, textLen: text.length, 
+                allLlmMsgs: llmMsgs, 
+                domChildren: conversationHistory.children.length 
+            });
             if (!msgEl) {
+                console.log('[LLM-STREAM] Creating new LLM message');
                 appendLLMMessage(text);
                 setLLMCursor(true);
                 return;
@@ -150,22 +214,23 @@
             currentTurnId = 0;
         }
 
-       function setLLMCursor(show) {
-            const currentMsg = document.getElementById(`llm-msg-${llmMessageCount}`);
-            let cursor = currentMsg?.querySelector('.cursor');
-            if (show) {
-                if (currentMsg && !cursor) {
-                    cursor = document.createElement('span');
-                    cursor.className = 'cursor';
-                    const textEl = currentMsg.querySelector('.message-text');
-                    if (textEl) {
-                        textEl.appendChild(cursor);
-                    }
-                }
-            } else if (cursor) {
-                cursor.remove();
-            }
-        }
+        function setLLMCursor(show) {
+             const currentMsg = activeLlmMessageId ? document.getElementById(activeLlmMessageId) : null;
+             if (!currentMsg) return;
+             let cursor = currentMsg.querySelector('.cursor');
+             if (show) {
+                 if (!cursor) {
+                     cursor = document.createElement('span');
+                     cursor.className = 'cursor';
+                     const textEl = currentMsg.querySelector('.message-text');
+                     if (textEl) {
+                         textEl.appendChild(cursor);
+                     }
+                 }
+             } else if (cursor) {
+                 cursor.remove();
+             }
+         }
 
         // Audio capture
         async function startAudioCapture() {
@@ -342,6 +407,10 @@
 
             ws.onopen = () => {
                 console.log('VAD WebSocket connected');
+                const dot = document.getElementById('dot-websocket');
+                if (dot) {
+                    dot.className = 'service-dot idle';
+                }
             };
 
             ws.onmessage = (event) => {
@@ -360,16 +429,31 @@
                         }
                         break;
 
-                   case 'llm_transcript':
-                        if (data.final) {
-                            appendLLMMessage(data.text);
-                            setLLMCursor(false);
-                            isLLMResponding = false;
-                        } else if (data.partial) {
-                            updateLLMStreaming(data.turn_id !== undefined ? data.turn_id : -1, data.text);
-                            isLLMResponding = true;
-                        }
-                        break;
+                    case 'llm_transcript':
+                         console.log('[WS] llm_transcript:', { final: data.final, partial: data.partial, turn_id: data.turn_id, textLen: data.text?.length, activeLlmMessageId, llmMessageCount, domChildren: conversationHistory.children.length });
+                         if (data.final) {
+                             console.log('[WS] llm_transcript FINAL: updating existing message or creating fallback');
+                             if (activeLlmMessageId) {
+                                 const msgEl = document.getElementById(activeLlmMessageId);
+                                 if (msgEl) {
+                                     console.log('[WS] llm_transcript: found active message element, setting text');
+                                     const textEl = msgEl.querySelector('.message-text');
+                                     textEl.textContent = data.text;
+                                     setLLMCursor(false);
+                                 } else {
+                                     console.log('[WS] llm_transcript: activeLlmMessageId element not in DOM!');
+                                 }
+                             } else {
+                                 console.log('[WS] llm_transcript: no activeLlmMessageId, creating new message');
+                                 appendLLMMessage(data.text);
+                                 setLLMCursor(false);
+                             }
+                             isLLMResponding = false;
+                         } else if (data.partial) {
+                             updateLLMStreaming(data.turn_id !== undefined ? data.turn_id : -1, data.text);
+                             isLLMResponding = true;
+                         }
+                         break;
 
                     case 'llm_audio':
                         if (data.turn_id !== undefined) {
@@ -396,26 +480,33 @@
                         userStatus.textContent = 'Processing...';
                         break;
 
-                     case 'llm_start':
-                        currentTurnId = data.turn_id || 0;
-                        previousTurnId = 0;
-                        llmMessageCount = 0;
-                        clearPendingAudioBuffers();
-                        if (activeLlmMessageId) {
-                            const oldMsg = document.getElementById(activeLlmMessageId);
-                            if (oldMsg) {
-                                oldMsg.remove();
-                            }
-                            const oldDivider = oldMsg?.nextElementSibling;
-                            if (oldDivider && oldDivider.classList.contains('message-divider')) {
-                                oldDivider.remove();
-                            }
-                            activeLlmMessageId = null;
-                        }
-                        llmStatus.textContent = 'Thinking...';
-                        isLLMResponding = true;
-			console.log("Reached llmMessageCount: " + String(llmMessageCount))
-                        break;
+                      case 'llm_start':
+                         console.log('[WS] llm_start:', { turn_id: data.turn_id, activeLlmMessageId, llmMessageCount, domChildren: conversationHistory.children.length });
+                         currentTurnId = data.turn_id || 0;
+                         previousTurnId = 0;
+                         llmMessageCount = 0;
+                         clearPendingAudioBuffers();
+                         if (activeLlmMessageId) {
+                             const oldMsg = document.getElementById(activeLlmMessageId);
+                             if (oldMsg) {
+                                 console.log('[WS] llm_start: removing old message', activeLlmMessageId);
+                                 oldMsg.remove();
+                             } else {
+                                 console.log('[WS] llm_start: activeLlmMessageId element not in DOM');
+                             }
+                             const oldDivider = oldMsg?.nextElementSibling;
+                             if (oldDivider && oldDivider.classList.contains('message-divider')) {
+                                 oldDivider.remove();
+                             }
+                             activeLlmMessageId = null;
+                         } else {
+                             console.log('[WS] llm_start: no activeLlmMessageId, nothing to clear');
+                         }
+                         console.log('[WS] llm_start: done, activeLlmMessageId=', activeLlmMessageId);
+                         llmStatus.textContent = 'Thinking...';
+                         isLLMResponding = true;
+ 			console.log("Reached llmMessageCount: " + String(llmMessageCount))
+                         break;
 
                     case 'llm_end':
                         llmStatus.textContent = 'Idle';
@@ -457,6 +548,26 @@
                         }
                         break;
 
+                    case 'service_status':
+                        const svc = data.service;
+                        const svcStatus = data.status;
+                        const dot = document.getElementById(`dot-${svc}`);
+                        if (dot) {
+                            dot.className = 'service-dot';
+                            if (svcStatus === 'active') {
+                                dot.classList.add('active');
+                            } else if (svcStatus === 'idle') {
+                                dot.classList.add('idle');
+                            } else {
+                                dot.classList.add('offline');
+                            }
+                        }
+                        if (serviceLastHeartbeat[svc] !== undefined) {
+                            resetServiceHeartbeat(svc);
+                            startServiceHeartbeatTimeout(svc);
+                        }
+                        break;
+
                     case 'reset_complete':
                         llmMessageCount = 0;
                         userMessageCount = 0;
@@ -475,6 +586,10 @@
             ws.onclose = () => {
                 console.log('VAD WebSocket disconnected, reconnecting...');
                 userStatus.textContent = 'Reconnecting...';
+                const dot = document.getElementById('dot-websocket');
+                if (dot) {
+                    dot.className = 'service-dot offline';
+                }
                 setTimeout(connectVAD, 2000);
             };
 

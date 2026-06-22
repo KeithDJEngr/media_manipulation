@@ -1,55 +1,26 @@
 # Remaining tasks
-## Review the repo and the contents of /tmp to see the results of the last run. Then take on the below tasks.
 
-## Tasks
+## Remaining TODOs
 
+### Bugs
+- [ ] VAD buffer issue: many "End of speech, buffer size: 0" messages indicate VAD fires before STT accumulates audio. May need to adjust silence threshold or add STT-side buffering.
+- [ ] The LLM transcription prints to the right side top message always, not to the newest one.
 
-~ When I reset the chat the STT still works fine but the LLM has an error displaying:
-LLM:
-2026-06-09 18:43:53,880 - INFO - An error occurred: sent 1011 (internal error) keepalive ping timeout; no close frame received
-2026-06-09 18:43:53,880 - ERROR - LLM processing error: sent 1011 (internal error) keepalive ping timeout; no close frame received
-2026-06-09 18:43:53,880 - INFO - LLM connection closed: sent 1011 (internal error) keepalive ping timeout; no close frame received
+### Improvements
+- [ ] Add TTS voice selection UI control (currently hardcoded to "eric")
+- [ ] Add conversation export (save chat history to file)
+- [ ] Add audio playback volume control in UI
+- [ ] The `llm_start` turn_id reset logic in browser can cause messages to appear out of order - investigate turn_id tracking
 
-~ The TTS is having an error with generating. It was working at one point.
-2026-06-09 18:43:56,923 - INFO - TTS synthesizing chunk: "Quick as you wanted!..."
-2026-06-09 18:43:57,423 - ERROR - TTS generation error: level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)
-2026-06-09 18:43:57,423 - INFO - Generating audio for sentence 46/46: "Let me know if you meant a different *Merlin* story or need ..."
-2026-06-09 18:43:57,423 - INFO - TTS synthesizing chunk: "Let me know if you meant a different *Merlin* story or need anything else...."
-2026-06-09 18:43:57,924 - ERROR - TTS generation error: level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)
+### Performance
+- [ ] STT performance investigation shows real-time factors < 0.1x for some lengths - inconsistent. Investigate GPU memory contention between models.
+- [ ] Consider batching multiple short utterances if VAD fires rapidly
+- [ ] TTS model warmup on each generation adds overhead - consider keeping model in memory between turns
 
-
-## Tasks for the future (please perform the above tasks then wait for the user confirmation to move onto these.
-~The llm response always updates the first in its list of messages and prints "Here" where the next message should go (at the end).
-Example of failure. I replaced the LLM's response with "ACTUAL LATEST RESPONSE" for clarity.:
-User
-Explain the plot of Merlin.
-LLM
-ACTUAL LATEST RESPONSE
-LLM
-Here
-User
-Okay.
-User
-Mm-hmm.
-User
-Thank you. Could that
-User
-Hello.
-LLM
-Here
-User
-Please make that more concise.
-User
-Please make that more concise.
-LLM
-Here
-User
-Yeah.
-LLM
-Here
-User
-What did I just say?
-User
-Did I just say?
-LLM
-Here
+### Future features
+- [ ] Consider adding a "listening history" panel separate from conversation
+- [ ] Multi-language support (current STT is English-only)
+- [ ] Wake word detection (always-listening mode)
+- [ ] Custom system prompt via UI
+- [ ] Conversation search
+- [ ] Audio quality settings (sample rate, bit depth)

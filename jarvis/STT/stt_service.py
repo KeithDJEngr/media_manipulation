@@ -176,6 +176,18 @@ class ParakeetSTT:
 
 async def handle_stt(websocket, stt_service):
     """Handle the STT WebSocket connection."""
+    async def send_heartbeats():
+        while True:
+            await asyncio.sleep(5)
+            try:
+                await websocket.send(json.dumps({"type": "heartbeat"}))
+            except Exception:
+                break
+
+    heartbeat_task = asyncio.create_task(send_heartbeats())
+    
+    waiting_for_audio_after_eos = False
+
     try:
         # Wait for client message
         try:
@@ -220,30 +232,40 @@ async def handle_stt(websocket, stt_service):
                                 "chunk_id": msg.get("chunk_id", 0),
                             }))
                             logger.info(f"Sent partial_transcript: {partial_text}")
+                            if waiting_for_audio_after_eos:
+                                waiting_for_audio_after_eos = False
+                                chunk_id = msg.get("chunk_id", 0)
+                                await websocket.send(json.dumps({
+                                    "type": "final_transcript",
+                                    "text": partial_text,
+                                    "final": True,
+                                    "chunk_id": chunk_id,
+                                }))
+                                logger.info(f"STT sent final_transcript to server (deferred from end_of_speech)")
                         stt_service.samples_since_last_partial = 0
 
                 elif msg_type == "end_of_speech":
                     logger.info(f"End of speech, buffer size: {len(stt_service.audio_buffer)}")
-                    # Transcribe accumulated audio
-                    text = stt_service.transcribe()
-                    if text:
-                        chunk_id = msg.get("chunk_id", 0)
-                        # Send partial transcript to browser
-                        await websocket.send(json.dumps({
-                            "type": "partial_transcript",
-                            "text": text,
-                            "chunk_id": chunk_id,
-                        }))
-                        # Send final transcript to LLM
-                        await websocket.send(json.dumps({
-                            "type": "final_transcript",
-                            "text": text,
-                            "final": True,
-                            "chunk_id": chunk_id,
-                        }))
-                        logger.info(f"STT transcription: \"{text}\"")
-                    # Clear partial text on end of speech
-                    stt_service.clear_buffer()
+                    if len(stt_service.audio_buffer) == 0:
+                        waiting_for_audio_after_eos = True
+                        logger.info("End of speech with empty buffer, waiting for audio chunk")
+                    else:
+                        waiting_for_audio_after_eos = False
+                        # Transcribe accumulated audio
+                        text = stt_service.transcribe()
+                        if text:
+                            chunk_id = msg.get("chunk_id", 0)
+                            logger.info(f"STT transcription: \"{text}\"")
+                            # Send final transcript to LLM
+                            await websocket.send(json.dumps({
+                                "type": "final_transcript",
+                                "text": text,
+                                "final": True,
+                                "chunk_id": chunk_id,
+                            }))
+                            logger.info(f"STT sent final_transcript to server")
+                        # Clear partial text on end of speech
+                        stt_service.clear_buffer()
 
                 elif msg_type == "partial":
                     # Partial transcription request (for streaming)
@@ -265,6 +287,26 @@ async def handle_stt(websocket, stt_service):
         logger.info(f"STT connection closed: {e}")
     except Exception as e:
         logger.error(f"STT connection error: {e}")
+    finally:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
+
+
+async def websocket_send_status(url, ssl_ctx, service, status):
+    """Quick helper to send a service_status message to the server."""
+    try:
+        async with websockets.connect(url, ssl=ssl_ctx) as ws:
+            await ws.send(json.dumps({"type": "start"}))
+            await ws.send(json.dumps({
+                "type": "service_status",
+                "service": service,
+                "status": status,
+            }))
+    except Exception:
+        pass
 
 
 async def main():
@@ -288,17 +330,29 @@ async def main():
         try:
             async with websockets.connect(stt_url, ssl=ssl_context) as websocket:
                 await websocket.send(json.dumps({"type": "start"}))
+                await websocket.send(json.dumps({
+                    "type": "service_status",
+                    "service": "stt",
+                    "status": "connected",
+                }))
                 logger.info("STT connected to server")
                 try:
                     await handle_stt(websocket, stt_service)
                 except websockets.ConnectionClosed:
+                    await websocket.send(json.dumps({
+                        "type": "service_status",
+                        "service": "stt",
+                        "status": "disconnected",
+                    }))
                     logger.info("STT connection closed, reconnecting...")
         except ConnectionRefusedError:
+            await websocket_send_status(stt_url, ssl_context, "stt", "disconnected")
             logger.error(
                 f"Could not connect to server at {stt_url}. "
                 f"Make sure the server is running on port {server_port}."
             )
         except Exception as e:
+            await websocket_send_status(stt_url, ssl_context, "stt", "error")
             logger.error(f"STT connection error: {e}")
         
         logger.info("STT service reconnecting in 3 seconds...")

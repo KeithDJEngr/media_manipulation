@@ -9,6 +9,8 @@ from http import HTTPStatus
 from websockets.http11 import Request, Response, Headers
 import websockets
 
+HEARTBEAT_TIMEOUT = 15
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -24,9 +26,23 @@ class ConnectionManager:
         self.vad_ws = None
         self.vad_browser_ws = None
         self.stt_ws = None
-        self.llm_ws = None
+        self.llm_client_ws = None  # Browser client connected to /llm
+        self.llm_service_ws = None  # LLM service connected to /llm_service
+        self.llm_ws = None  # Legacy alias for backward compatibility
         self.tts_ws = None
         self.conversation_history = []
+        self.service_status = {
+            "vad": "offline",
+            "stt": "offline",
+            "llm": "offline",
+            "tts": "offline",
+        }
+        self.service_active = {
+            "vad": False,
+            "stt": False,
+            "llm": False,
+            "tts": False,
+        }
         
     async def register_client(self, websocket):
         self.client_ws = websocket
@@ -43,43 +59,78 @@ class ConnectionManager:
             logger.info("Browser connected to VAD endpoint")
         else:
             self.vad_ws = websocket
+            self.service_status["vad"] = "idle"
             logger.info("VAD service connected")
             await self.broadcast_to_client({"type": "vad_connected"})
+            await self.set_service_status("vad", "idle")
         
     async def unregister_vad(self, websocket):
         if self.vad_ws == websocket:
             self.vad_ws = None
+            self.service_active["vad"] = False
+            self.service_status["vad"] = "offline"
             logger.info("VAD service disconnected")
+            await self.set_service_status("vad", "offline")
         elif self.vad_browser_ws == websocket:
             self.vad_browser_ws = None
             logger.info("Browser disconnected from VAD endpoint")
         
     async def register_stt(self, websocket):
         self.stt_ws = websocket
+        self.service_status["stt"] = "idle"
         logger.info("STT service connected")
+        await self.set_service_status("stt", "idle")
         
     async def unregister_stt(self, websocket):
         if self.stt_ws == websocket:
             self.stt_ws = None
-        logger.info("STT service disconnected")
+            self.service_active["stt"] = False
+            self.service_status["stt"] = "offline"
+            logger.info("STT service disconnected")
+            await self.set_service_status("stt", "offline")
         
-    async def register_llm(self, websocket):
-        self.llm_ws = websocket
-        logger.info("LLM service connected")
+    async def register_llm(self, websocket, is_service=False):
+        if is_service:
+            self.llm_service_ws = websocket
+            self.service_status["llm"] = "idle"
+            logger.info("LLM service connected")
+            await self.set_service_status("llm", "idle")
+        else:
+            self.llm_client_ws = websocket
+            self.service_status["llm"] = "idle"
+            logger.info("LLM client connected")
+        # Keep legacy alias pointing to service ws for backward compat
+        if is_service:
+            self.llm_ws = websocket
+        elif self.llm_ws is None:
+            self.llm_ws = websocket
         
     async def unregister_llm(self, websocket):
+        if self.llm_service_ws == websocket:
+            self.llm_service_ws = None
+            self.service_active["llm"] = False
+            self.service_status["llm"] = "offline"
+            logger.info("LLM service disconnected")
+            await self.set_service_status("llm", "offline")
+        elif self.llm_client_ws == websocket:
+            self.llm_client_ws = None
+            logger.info("LLM client disconnected")
         if self.llm_ws == websocket:
             self.llm_ws = None
-        logger.info("LLM service disconnected")
         
     async def register_tts(self, websocket):
         self.tts_ws = websocket
+        self.service_status["tts"] = "idle"
         logger.info("TTS service connected")
+        await self.set_service_status("tts", "idle")
         
     async def unregister_tts(self, websocket):
         if self.tts_ws == websocket:
             self.tts_ws = None
-        logger.info("TTS service disconnected")
+            self.service_active["tts"] = False
+            self.service_status["tts"] = "offline"
+            logger.info("TTS service disconnected")
+            await self.set_service_status("tts", "offline")
         
     async def broadcast_to_client(self, message):
         if self.client_ws and self.client_ws.state.name == "OPEN":
@@ -120,6 +171,15 @@ class ConnectionManager:
         elif to_service == "tts":
             await self.broadcast_to_service("tts", message)
 
+    async def set_service_status(self, service, status):
+        """Update service status and broadcast to all clients."""
+        self.service_status[service] = status
+        await self.broadcast_to_client({
+            "type": "service_status",
+            "service": service,
+            "status": status,
+        })
+
     async def broadcast_to_vad(self, message):
         """Send message to the VAD service."""
         ws = self.vad_ws
@@ -128,6 +188,56 @@ class ConnectionManager:
                 await ws.send(json.dumps(message))
             except Exception as e:
                 logger.error(f"Error sending to VAD: {e}")
+
+    async def set_service_active(self, service, active):
+        """Set a service's active state and broadcast if changed."""
+        if self.service_active.get(service) == active:
+            return
+        self.service_active[service] = active
+        if active:
+            self.service_status[service] = "active"
+        elif self.service_status.get(service) == "active":
+            self.service_status[service] = "idle"
+        await self.set_service_status(service, self.service_status[service])
+
+    async def set_websocket_status(self, status):
+        """Set the WebSocket (WEB) status indicator."""
+        self.service_status["web"] = status
+        await self.broadcast_to_client({
+            "type": "service_status",
+            "service": "web",
+            "status": status,
+        })
+
+
+async def create_heartbeat_task(last_heartbeat, handler_cancel_scope):
+    """Create a task that checks for heartbeat timeout per service.
+    
+    last_heartbeat: dict mapping service name -> last heartbeat unix timestamp
+    handler_cancel_scope: list to store the task for cancellation
+    """
+    services = ["vad", "stt", "llm", "tts"]
+    
+    # Initialize all services as offline at handler start
+    for svc in services:
+        if svc not in last_heartbeat:
+            last_heartbeat[svc] = 0
+
+    async def check():
+        while True:
+            await asyncio.sleep(1)
+            now = asyncio.get_event_loop().time()
+            for svc in services:
+                last = last_heartbeat.get(svc, 0)
+                if last > 0 and (now - last) > HEARTBEAT_TIMEOUT:
+                    logger.info(f"Heartbeat timeout for {svc}, broadcasting offline")
+                    manager.service_status[svc] = "offline"
+                    await manager.set_service_status(svc, "offline")
+                    last_heartbeat[svc] = 0
+    
+    task = asyncio.create_task(check())
+    handler_cancel_scope.append(task)
+
 
 manager = ConnectionManager()
 
@@ -229,6 +339,7 @@ async def handle_vad(websocket):
     VAD output is processed by handle_vad_service (not here).
     """
     await manager.register_vad(websocket, is_browser=True)
+    await manager.set_service_active("vad", True)
     vad_chunk_id = 0
 
     try:
@@ -238,6 +349,7 @@ async def handle_vad(websocket):
                     # Binary: raw Int16 audio from browser - forward to VAD service
                     vad_chunk_id += 1
                     logger.info(f"Browser -> VAD: audio_chunk chunk_id={vad_chunk_id} size={len(message)} bytes")
+                    await manager.set_service_active("vad", True)
                     await manager.broadcast_to_vad({
                         "type": "audio_chunk",
                         "audio": base64.b64encode(message).decode("ascii"),
@@ -249,11 +361,16 @@ async def handle_vad(websocket):
     except Exception as e:
         logger.error(f"VAD error: {e}")
     finally:
+        await manager.set_service_active("vad", False)
         await manager.unregister_vad(websocket)
 
 async def handle_vad_service(websocket):
     """Handle VAD service connection (separate from browser)."""
     await manager.register_vad(websocket, is_browser=False)
+    
+    last_heartbeat = {}
+    handler_cancel_scope = []
+    heartbeat_task = await create_heartbeat_task(last_heartbeat, handler_cancel_scope)
     
     try:
         async for message in websocket:
@@ -267,7 +384,14 @@ async def handle_vad_service(websocket):
                         logger.info("VAD service acknowledged")
                         continue
 
+                    if msg_type == "heartbeat":
+                        import time
+                        last_heartbeat["vad"] = asyncio.get_event_loop().time()
+                        continue
+
                     if msg_type == "audio_chunk":
+                        await manager.set_service_active("vad", True)
+                        await manager.set_service_active("stt", True)
                         await manager.broadcast_to_service("stt", {
                             "type": "audio_chunk",
                             "audio": data.get("audio"),
@@ -275,6 +399,8 @@ async def handle_vad_service(websocket):
                         })
                     elif msg_type == "vad_result":
                         if data.get("silence"):
+                            await manager.set_service_active("vad", True)
+                            await manager.set_service_active("stt", True)
                             await manager.broadcast_to_service("stt", {
                                 "type": "end_of_speech",
                                 "chunk_id": data.get("chunk_id")
@@ -290,11 +416,19 @@ async def handle_vad_service(websocket):
             except Exception as e:
                 logger.error(f"VAD service error: {e}")
     finally:
+        for t in handler_cancel_scope:
+            t.cancel()
+        await manager.set_service_active("vad", False)
+        await manager.set_service_active("stt", False)
         await manager.unregister_vad(websocket)
 
 async def handle_stt(websocket):
     """Handle STT service connection."""
     await manager.register_stt(websocket)
+    
+    last_heartbeat = {}
+    handler_cancel_scope = []
+    heartbeat_task = await create_heartbeat_task(last_heartbeat, handler_cancel_scope)
     
     try:
         async for message in websocket:
@@ -306,7 +440,12 @@ async def handle_stt(websocket):
                     await websocket.send(json.dumps({"type": "start"}))
                     continue
                     
+                if msg_type == "heartbeat":
+                    last_heartbeat["stt"] = asyncio.get_event_loop().time()
+                    continue
+                    
                 if msg_type == "partial_transcript":
+                    await manager.set_service_active("stt", True)
                     logger.info("STT partial_transcript: '%s'", data.get("text", ""))
                     await manager.broadcast_to_client({
                         "type": "user_partial",
@@ -315,6 +454,8 @@ async def handle_stt(websocket):
                     })
                     
                 elif msg_type == "final_transcript":
+                    await manager.set_service_active("stt", True)
+                    await manager.set_service_active("llm", True)
                     user_text = data.get("text", "")
                     logger.info("STT final_transcript: '%s'", user_text)
                     await manager.broadcast_to_client({
@@ -323,22 +464,25 @@ async def handle_stt(websocket):
                         "final": True,
                         "chunk_id": data.get("chunk_id")
                     })
-                    # Skip short filler words (less than 3 words) to avoid unnecessary LLM responses
-                    if len(user_text.strip().split()) < 3:
-                        logger.info(f"Skipping short transcription: '{user_text}'")
-                        return
                     manager.conversation_history.append({"role": "user", "content": user_text})
-                    await manager.forward_message("stt", "llm", {
-                        "type": "user_input",
-                        "text": user_text,
-                        "history": manager.conversation_history
-                    })
+                    # Forward directly to LLM service (not through browser /llm endpoint)
+                    ws_to_send = manager.llm_service_ws if manager.llm_service_ws else manager.llm_ws
+                    if ws_to_send and ws_to_send.state.name == "OPEN":
+                        await ws_to_send.send(json.dumps({
+                            "type": "user_input",
+                            "text": user_text,
+                            "history": manager.conversation_history,
+                        }))
+                        logger.info(f"Forwarded user_input to LLM service")
                     
             except json.JSONDecodeError:
                 logger.error("Invalid JSON from STT")
     except Exception as e:
         logger.error(f"STT error: {e}")
     finally:
+        for t in handler_cancel_scope:
+            t.cancel()
+        await manager.set_service_active("stt", False)
         await manager.unregister_stt(websocket)
 
 async def handle_llm(websocket):
@@ -347,11 +491,12 @@ async def handle_llm(websocket):
     Clients send user_input and receive llm_transcript/llm_audio messages.
     user_input is forwarded to the LLM service on /llm_service.
     """
-    await manager.register_llm(websocket)
+    await manager.register_llm(websocket, is_service=False)
     
     # Accumulate tokens for complete response
     accumulated_llm_text = ""
     current_turn_id = 0
+    llm_service_connected = False
 
     try:
         async for message in websocket:
@@ -361,14 +506,19 @@ async def handle_llm(websocket):
                 
                 # Handle messages from LLM service (llm_start, llm_token, llm_end)
                 if msg_type == "llm_start":
+                    await manager.set_service_active("llm", True)
+                    llm_service_connected = True
                     accumulated_llm_text = ""
                     current_turn_id += 1
+                    logger.info(f"[LLM-HANDLER] Broadcasting llm_start turn_id={current_turn_id}")
                     await manager.broadcast_to_client({"type": "llm_start", "turn_id": current_turn_id})
                     
                 elif msg_type == "llm_token":
+                    await manager.set_service_active("llm", True)
                     token_text = data.get("text", "")
                     accumulated_llm_text += token_text
                     # Show transcript to browser (individual tokens for streaming display)
+                    logger.info(f"[LLM-HANDLER] Broadcasting llm_transcript turn_id={current_turn_id} textLen={len(accumulated_llm_text)}")
                     await manager.broadcast_to_client({
                         "type": "llm_transcript",
                         "text": accumulated_llm_text,
@@ -377,6 +527,9 @@ async def handle_llm(websocket):
                     })
                     
                 elif msg_type == "llm_end":
+                    await manager.set_service_active("llm", False)
+                    await manager.set_service_active("tts", True)
+                    logger.info(f"[LLM-HANDLER] Broadcasting llm_end turn_id={current_turn_id} textLen={len(accumulated_llm_text)}")
                     await manager.broadcast_to_client({
                         "type": "llm_end",
                         "turn_id": current_turn_id,
@@ -396,8 +549,9 @@ async def handle_llm(websocket):
                 # Handle messages from browser/client (user_input)
                 elif msg_type == "user_input":
                     # Forward to LLM service for processing
-                    if manager.llm_ws and manager.llm_ws.state.name == "OPEN":
-                        await manager.llm_ws.send(json.dumps({
+                    ws_to_send = manager.llm_service_ws if manager.llm_service_ws else manager.llm_ws
+                    if ws_to_send and ws_to_send.state.name == "OPEN":
+                        await ws_to_send.send(json.dumps({
                             "type": "user_input",
                             "text": data.get("text", "")
                         }))
@@ -408,7 +562,8 @@ async def handle_llm(websocket):
     except Exception as e:
         logger.error(f"LLM error: {e}")
     finally:
-        await manager.unregister_llm(websocket)
+        await manager.set_service_active("llm", False)
+        await manager.unregister_llm(websocket, is_service=False)
 
 async def handle_llm_service(websocket):
     """Handle LLM service connection to /llm_service endpoint.
@@ -416,12 +571,15 @@ async def handle_llm_service(websocket):
     LLM service sends llm_start, llm_token, llm_end messages.
     Receives user_input from the server.
     """
-    await manager.register_llm(websocket)
+    await manager.register_llm(websocket, is_service=True)
     await websocket.send(json.dumps({"type": "start"}))
     logger.info("LLM service ready")
     
     accumulated_llm_text = ""
     current_turn_id = 0
+    last_heartbeat = {}
+    handler_cancel_scope = []
+    heartbeat_task = await create_heartbeat_task(last_heartbeat, handler_cancel_scope)
     
     try:
         async for message in websocket:
@@ -430,13 +588,21 @@ async def handle_llm_service(websocket):
                 msg_type = data.get("type")
                 
                 if msg_type == "llm_start":
+                    await manager.set_service_active("llm", True)
                     accumulated_llm_text = ""
                     current_turn_id += 1
+                    logger.info(f"[LLM-SERVICE] Broadcasting llm_start turn_id={current_turn_id}")
                     await manager.broadcast_to_client({"type": "llm_start", "turn_id": current_turn_id})
                     
+                elif msg_type == "heartbeat":
+                    last_heartbeat["llm"] = asyncio.get_event_loop().time()
+                    continue
+                
                 elif msg_type == "llm_token":
+                    await manager.set_service_active("llm", True)
                     token_text = data.get("text", "")
                     accumulated_llm_text += token_text
+                    logger.info(f"[LLM-SERVICE] Broadcasting llm_transcript turn_id={current_turn_id} textLen={len(accumulated_llm_text)}")
                     await manager.broadcast_to_client({
                         "type": "llm_transcript",
                         "text": accumulated_llm_text,
@@ -445,6 +611,9 @@ async def handle_llm_service(websocket):
                     })
                     
                 elif msg_type == "llm_end":
+                    await manager.set_service_active("llm", False)
+                    await manager.set_service_active("tts", True)
+                    logger.info(f"[LLM-SERVICE] Broadcasting llm_end turn_id={current_turn_id} textLen={len(accumulated_llm_text)}")
                     await manager.broadcast_to_client({
                         "type": "llm_end",
                         "turn_id": current_turn_id,
@@ -462,22 +631,31 @@ async def handle_llm_service(websocket):
                     accumulated_llm_text = ""
                     
                 elif msg_type == "user_input":
+                    await manager.set_service_active("llm", True)
                     logger.info(f"LLM received input: \"{data.get('text', '')}\"")
                     if manager.tts_ws and manager.tts_ws.state.name == "OPEN":
                         await manager.tts_ws.send(json.dumps({"type": "stop_generation"}))
                     
-            except json.JSONDecodeError:
-                logger.error("Invalid JSON from LLM service")
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON from LLM service: {e}")
     except Exception as e:
         logger.error(f"LLM service error: {e}")
     finally:
-        await manager.unregister_llm(websocket)
+        for t in handler_cancel_scope:
+            t.cancel()
+        await manager.set_service_active("llm", False)
+        await manager.unregister_llm(websocket, is_service=True)
 
 async def handle_tts(websocket):
     """Handle TTS service connection."""
     await manager.register_tts(websocket)
     await websocket.send(json.dumps({"type": "start"}))
+    await websocket.send(json.dumps({"type": "service_status", "service": "tts", "status": "idle"}))
     logger.info("TTS service ready")
+    
+    last_heartbeat = {}
+    handler_cancel_scope = []
+    heartbeat_task = await create_heartbeat_task(last_heartbeat, handler_cancel_scope)
     
     try:
         async for message in websocket:
@@ -485,7 +663,12 @@ async def handle_tts(websocket):
                 data = json.loads(message)
                 msg_type = data.get("type")
                 
+                if msg_type == "heartbeat":
+                    last_heartbeat["tts"] = asyncio.get_event_loop().time()
+                    continue
+                
                 if msg_type == "audio_chunk":
+                    await manager.set_service_active("tts", True)
                     await manager.broadcast_to_client({
                         "type": "llm_audio",
                         "audio": data.get("audio", ""),
@@ -494,6 +677,7 @@ async def handle_tts(websocket):
                     })
                     
                 elif msg_type == "audio_end":
+                    await manager.set_service_active("tts", False)
                     await manager.broadcast_to_client({
                         "type": "audio_complete",
                         "turn_id": data.get("turn_id"),
@@ -504,6 +688,9 @@ async def handle_tts(websocket):
     except Exception as e:
         logger.error(f"TTS error: {e}")
     finally:
+        for t in handler_cancel_scope:
+            t.cancel()
+        await manager.set_service_active("tts", False)
         await manager.unregister_tts(websocket)
 
 async def handler(websocket):
