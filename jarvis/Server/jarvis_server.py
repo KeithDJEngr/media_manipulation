@@ -133,6 +133,9 @@ class ConnectionManager:
             await self.set_service_status("tts", "offline")
         
     async def broadcast_to_client(self, message):
+        msg_type = message.get("type", "unknown")
+        if msg_type in ("llm_start", "llm_transcript", "llm_end", "llm_audio", "user_transcript"):
+            logger.info(f"[BROADCAST] type={msg_type} turn_id={message.get('turn_id', 'N/A')} textLen={len(message.get('text', ''))}")
         if self.client_ws and self.client_ws.state.name == "OPEN":
             try:
                 await self.client_ws.send(json.dumps(message))
@@ -446,12 +449,28 @@ async def handle_stt(websocket):
                     
                 if msg_type == "partial_transcript":
                     await manager.set_service_active("stt", True)
-                    logger.info("STT partial_transcript: '%s'", data.get("text", ""))
+                    partial_text = data.get("text", "")
+                    logger.info("STT partial_transcript: '%s'", partial_text)
                     await manager.broadcast_to_client({
                         "type": "user_partial",
                         "text": data.get("text", ""),
                         "chunk_id": data.get("chunk_id")
                     })
+                    # Update the latest user message in conversation_history so the LLM sees partials
+                    for i in range(len(manager.conversation_history) - 1, -1, -1):
+                        if manager.conversation_history[i]["role"] == "user":
+                            manager.conversation_history[i]["content"] = partial_text
+                            logger.info("Updated partial transcript in conversation_history: '%s'", partial_text)
+                            break
+                    # Also forward partial to LLM service if it's actively generating
+                    ws_to_send = manager.llm_service_ws if manager.llm_service_ws else manager.llm_ws
+                    if ws_to_send and ws_to_send.state.name == "OPEN":
+                        await ws_to_send.send(json.dumps({
+                            "type": "user_input",
+                            "text": partial_text,
+                            "history": manager.conversation_history,
+                            "partial": True,
+                        }))
                     
                 elif msg_type == "final_transcript":
                     await manager.set_service_active("stt", True)
@@ -464,7 +483,17 @@ async def handle_stt(websocket):
                         "final": True,
                         "chunk_id": data.get("chunk_id")
                     })
-                    manager.conversation_history.append({"role": "user", "content": user_text})
+                    # Replace the last user message (updated by partial) with the final text
+                    # or append a new one if no partial was set yet
+                    user_appended = False
+                    for i in range(len(manager.conversation_history) - 1, -1, -1):
+                        if manager.conversation_history[i]["role"] == "user":
+                            manager.conversation_history[i]["content"] = user_text
+                            user_appended = True
+                            break
+                    if not user_appended:
+                        manager.conversation_history.append({"role": "user", "content": user_text})
+                    logger.info(f"STT conversation_history before forwarding to LLM: {json.dumps(manager.conversation_history, ensure_ascii=False)}")
                     # Forward directly to LLM service (not through browser /llm endpoint)
                     ws_to_send = manager.llm_service_ws if manager.llm_service_ws else manager.llm_ws
                     if ws_to_send and ws_to_send.state.name == "OPEN":
@@ -591,7 +620,7 @@ async def handle_llm_service(websocket):
                     await manager.set_service_active("llm", True)
                     accumulated_llm_text = ""
                     current_turn_id += 1
-                    logger.info(f"[LLM-SERVICE] Broadcasting llm_start turn_id={current_turn_id}")
+                    logger.info(f"[LLM-SERVICE] >>> llm_start turn_id={current_turn_id} (accumulated_text_len=0)")
                     await manager.broadcast_to_client({"type": "llm_start", "turn_id": current_turn_id})
                     
                 elif msg_type == "heartbeat":
@@ -602,7 +631,7 @@ async def handle_llm_service(websocket):
                     await manager.set_service_active("llm", True)
                     token_text = data.get("text", "")
                     accumulated_llm_text += token_text
-                    logger.info(f"[LLM-SERVICE] Broadcasting llm_transcript turn_id={current_turn_id} textLen={len(accumulated_llm_text)}")
+                    logger.info(f"[LLM-SERVICE] >>> llm_transcript turn_id={current_turn_id} tokenLen={len(token_text)} accumulatedLen={len(accumulated_llm_text)}")
                     await manager.broadcast_to_client({
                         "type": "llm_transcript",
                         "text": accumulated_llm_text,
@@ -613,7 +642,7 @@ async def handle_llm_service(websocket):
                 elif msg_type == "llm_end":
                     await manager.set_service_active("llm", False)
                     await manager.set_service_active("tts", True)
-                    logger.info(f"[LLM-SERVICE] Broadcasting llm_end turn_id={current_turn_id} textLen={len(accumulated_llm_text)}")
+                    logger.info(f"[LLM-SERVICE] >>> llm_end turn_id={current_turn_id} finalTextLen={len(accumulated_llm_text)} text='{accumulated_llm_text[:100]}'")
                     await manager.broadcast_to_client({
                         "type": "llm_end",
                         "turn_id": current_turn_id,

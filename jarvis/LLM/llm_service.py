@@ -94,7 +94,7 @@ async def handle_llm(websocket, llm_info):
                     if not user_text.strip():
                         continue
                         
-                    logger.info(f"LLM received input: \"{user_text}\"")
+                    is_partial = msg.get("partial", False)
                     
                     # Accept history from server if provided
                     if "history" in msg:
@@ -105,10 +105,17 @@ async def handle_llm(websocket, llm_info):
                         else:
                             conversation_history = [{"role": "system", "content": SYSTEM_PROMPT}]
                             conversation_history.extend(new_history)
+                    
+                    logger.info(f"LLM-SERVICE <<< user_input (partial={is_partial}, text='{user_text[:80]}...')")
+                    
+                    # For partials, just update history without generating a response
+                    if is_partial:
+                        continue
 
+                    logger.info(f"LLM-SERVICE >>> conversation_history for LLM: {json.dumps(conversation_history, ensure_ascii=False, indent=2)}")
+                    
                     # Send start signal
-                    # TODO: llm_start only appears to be sent once and then stays at 0 for llmMessageCount. Need to resolve.
-                    logger.info("sending llm_start")
+                    logger.info(f"LLM-SERVICE: sending llm_start (user_text='{user_text[:80]}...')")
                     await websocket.send(json.dumps({"type": "llm_start"}))
                     
                     last_token = None
@@ -130,9 +137,8 @@ async def handle_llm(websocket, llm_info):
 
 
 
-                    # Build messages list with full conversation history
+                    # Build messages list with full conversation history (user text already in history from server)
                     messages = conversation_history.copy()
-                    messages.append({"role": "user", "content": user_text})
 
                     payload = {
                         "model": llm_info['model'],
@@ -151,6 +157,7 @@ async def handle_llm(websocket, llm_info):
 
                             # CRITICAL CHANGE: Use .stream("POST", ...) instead of .post()
                             # This forces httpx to handle the response as a stream immediately.
+                            token_count = 0
                             async with client.stream("POST", llm_info['api_url'], json=payload) as response:
                                 if response.status_code != 200:
                                     logger.info(f"Error: {response.status_code}")
@@ -180,13 +187,15 @@ async def handle_llm(websocket, llm_info):
 
                                             if token:
                                                 llm_msg+=token
-                                                logger.info(f"token: {token}")
+                                                token_count += 1
+                                                if token_count <= 3 or token_count % 20 == 0:
+                                                    logger.info(f"LLM-SERVICE: token #{token_count}: '{token}' (accumulated so far: '{llm_msg[:80]}...')")
                                                 await websocket.send(json.dumps({"type": "llm_token", "text": token, "partial": True}))
 
                                     except json.JSONDecodeError:
                                         continue
 
-                                logger.info("\n\nDone.")
+                                logger.info(f"\n\nDone. Total tokens streamed: {token_count}")
 
                     except httpx.ConnectError:
                         logger.info("Could not connect. Make sure Ollama is running or check IP address.")
@@ -205,8 +214,7 @@ async def handle_llm(websocket, llm_info):
 
 
 
-                    # Add to conversation history
-                    conversation_history.append({"role": "user", "content": user_text})
+                    # Add to conversation history (user message already in history from server)
                     conversation_history.append({"role": "assistant", "content": llm_msg})
 
                     # Trim history to keep last 20 messages (system prompt + 19 turns) to manage context window
@@ -214,6 +222,7 @@ async def handle_llm(websocket, llm_info):
                         conversation_history = conversation_history[:2] + conversation_history[-19:]
 
                     # Send end signal with accumulated text
+                    logger.info(f"LLM-SERVICE: sending llm_end (total_text_len={len(llm_msg)}, text='{llm_msg[:100]}...')")
                     await websocket.send(json.dumps({
                         "type": "llm_end",
                         "text": llm_msg,

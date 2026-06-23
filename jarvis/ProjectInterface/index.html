@@ -127,6 +127,7 @@
             row.className = 'message-row llm';
             row.id = `llm-msg-${llmMessageCount}`;
             activeLlmMessageId = row.id;
+            console.log('[DOM] appendLLMMessage: creating', row.id, 'with textLen=', text.length);
             row.innerHTML = `<div class="message-bubble"><div class="message-label">LLM</div><div class="message-text">${escapeHtml(text)}</div></div>`;
             conversationHistory.appendChild(row);
             const divider = document.createElement('div');
@@ -172,15 +173,22 @@
                 activeLlmMessageId, msgEl: msgEl ? msgEl.id : 'null', 
                 llmMessageCount, textLen: text.length, 
                 allLlmMsgs: llmMsgs, 
-                domChildren: conversationHistory.children.length 
+                domChildren: conversationHistory.children.length,
+                expectedTextLen: text.length
             });
             if (!msgEl) {
-                console.log('[LLM-STREAM] Creating new LLM message');
+                console.log('[LLM-STREAM] Creating new LLM message (no active element found)');
                 appendLLMMessage(text);
                 setLLMCursor(true);
                 return;
             }
             const textEl = msgEl.querySelector('.message-text');
+            if (!textEl) {
+                console.log('[LLM-STREAM] WARNING: found element but no .message-text child, creating new message instead');
+                appendLLMMessage(text);
+                setLLMCursor(true);
+                return;
+            }
             textEl.textContent = text;
             conversationHistory.scrollTop = conversationHistory.scrollHeight;
         }
@@ -430,30 +438,37 @@
                         break;
 
                     case 'llm_transcript':
-                         console.log('[WS] llm_transcript:', { final: data.final, partial: data.partial, turn_id: data.turn_id, textLen: data.text?.length, activeLlmMessageId, llmMessageCount, domChildren: conversationHistory.children.length });
-                         if (data.final) {
-                             console.log('[WS] llm_transcript FINAL: updating existing message or creating fallback');
-                             if (activeLlmMessageId) {
-                                 const msgEl = document.getElementById(activeLlmMessageId);
-                                 if (msgEl) {
-                                     console.log('[WS] llm_transcript: found active message element, setting text');
-                                     const textEl = msgEl.querySelector('.message-text');
-                                     textEl.textContent = data.text;
-                                     setLLMCursor(false);
-                                 } else {
-                                     console.log('[WS] llm_transcript: activeLlmMessageId element not in DOM!');
-                                 }
-                             } else {
-                                 console.log('[WS] llm_transcript: no activeLlmMessageId, creating new message');
-                                 appendLLMMessage(data.text);
-                                 setLLMCursor(false);
-                             }
-                             isLLMResponding = false;
-                         } else if (data.partial) {
-                             updateLLMStreaming(data.turn_id !== undefined ? data.turn_id : -1, data.text);
-                             isLLMResponding = true;
-                         }
-                         break;
+                          console.log('[WS] llm_transcript:', { final: data.final, partial: data.partial, turn_id: data.turn_id, textLen: data.text?.length, activeLlmMessageId, llmMessageCount });
+                          if (data.final) {
+                              console.log('[WS] llm_transcript FINAL: updating existing message or creating fallback');
+                              if (activeLlmMessageId) {
+                                  const msgEl = document.getElementById(activeLlmMessageId);
+                                  if (msgEl) {
+                                      console.log('[WS] llm_transcript FINAL: found active message element, setting text');
+                                      const textEl = msgEl.querySelector('.message-text');
+                                      if (textEl) {
+                                          textEl.textContent = data.text;
+                                      } else {
+                                          console.log('[WS] llm_transcript FINAL: no .message-text, creating new message');
+                                          appendLLMMessage(data.text);
+                                      }
+                                      setLLMCursor(false);
+                                  } else {
+                                      console.log('[WS] llm_transcript FINAL: activeLlmMessageId element not in DOM, creating new message');
+                                      appendLLMMessage(data.text);
+                                      setLLMCursor(false);
+                                  }
+                              } else {
+                                  console.log('[WS] llm_transcript FINAL: no activeLlmMessageId, creating new message');
+                                  appendLLMMessage(data.text);
+                                  setLLMCursor(false);
+                              }
+                              isLLMResponding = false;
+                          } else if (data.partial) {
+                              updateLLMStreaming(data.turn_id !== undefined ? data.turn_id : -1, data.text);
+                              isLLMResponding = true;
+                          }
+                          break;
 
                     case 'llm_audio':
                         if (data.turn_id !== undefined) {
@@ -480,41 +495,49 @@
                         userStatus.textContent = 'Processing...';
                         break;
 
-                      case 'llm_start':
-                         console.log('[WS] llm_start:', { turn_id: data.turn_id, activeLlmMessageId, llmMessageCount, domChildren: conversationHistory.children.length });
-                         currentTurnId = data.turn_id || 0;
-                         previousTurnId = 0;
-                         llmMessageCount = 0;
-                         clearPendingAudioBuffers();
-                         if (activeLlmMessageId) {
-                             const oldMsg = document.getElementById(activeLlmMessageId);
-                             if (oldMsg) {
-                                 console.log('[WS] llm_start: removing old message', activeLlmMessageId);
-                                 oldMsg.remove();
-                             } else {
-                                 console.log('[WS] llm_start: activeLlmMessageId element not in DOM');
-                             }
-                             const oldDivider = oldMsg?.nextElementSibling;
-                             if (oldDivider && oldDivider.classList.contains('message-divider')) {
-                                 oldDivider.remove();
-                             }
-                             activeLlmMessageId = null;
-                         } else {
-                             console.log('[WS] llm_start: no activeLlmMessageId, nothing to clear');
-                         }
-                         console.log('[WS] llm_start: done, activeLlmMessageId=', activeLlmMessageId);
-                         llmStatus.textContent = 'Thinking...';
-                         isLLMResponding = true;
- 			console.log("Reached llmMessageCount: " + String(llmMessageCount))
-                         break;
+                    case 'llm_start':
+                          console.log('[WS] llm_start: received', { turn_id: data.turn_id, activeLlmMessageId, llmMessageCount, allLlmMsgs: Array.from(conversationHistory.querySelectorAll('.message-row.llm')).map(el => el.id) });
+                          currentTurnId = data.turn_id || 0;
+                          previousTurnId = 0;
+                          clearPendingAudioBuffers();
+                          // Only remove the currently streaming message (activeLlmMessageId != null means still generating)
+                          // If activeLlmMessageId is null, the previous turn's message is already finalized and stays in DOM
+                          if (activeLlmMessageId) {
+                              const oldMsg = document.getElementById(activeLlmMessageId);
+                              if (oldMsg && conversationHistory.contains(oldMsg)) {
+                                  console.log('[WS] llm_start: removing streaming message', activeLlmMessageId);
+                                  oldMsg.remove();
+                                  const oldDivider = oldMsg.nextElementSibling;
+                                  if (oldDivider && oldDivider.classList.contains('message-divider')) {
+                                      oldDivider.remove();
+                                  }
+                              } else {
+                                  console.log('[WS] llm_start: streaming message element stale, removing all LLM msgs');
+                                  const staleMsgs = Array.from(conversationHistory.querySelectorAll('.message-row.llm'));
+                                  const staleDivs = Array.from(conversationHistory.querySelectorAll('.message-divider'));
+                                  staleMsgs.forEach(m => m.remove());
+                                  staleDivs.forEach(d => d.remove());
+                              }
+                          } else {
+                              const existingLlmMsgs = Array.from(conversationHistory.querySelectorAll('.message-row.llm'));
+                              console.log('[WS] llm_start: no active message (prev turn already ended), keeping', existingLlmMsgs.length, 'existing LLM message(s)');
+                          }
+                          activeLlmMessageId = null;
+                          console.log('[WS] llm_start: done, remaining llmMsgs:', conversationHistory.querySelectorAll('.message-row.llm').length);
+                          llmStatus.textContent = 'Thinking...';
+                          isLLMResponding = true;
+  			console.log("Reached llmMessageCount: " + String(llmMessageCount))
+                          break;
 
                     case 'llm_end':
+                        console.log('[WS] llm_end: received', { turn_id: data.turn_id, activeLlmMessageId, llmMessageCount });
                         llmStatus.textContent = 'Idle';
                         if (data.turn_id) {
                             previousTurnId = data.turn_id;
                         }
                         const llmMsgEl = activeLlmMessageId ? document.getElementById(activeLlmMessageId) : null;
                         if (llmMsgEl) {
+                            console.log('[WS] llm_end: found active message, clearing cursor');
                             setLLMCursor(false);
                             const textEl = llmMsgEl.querySelector('.message-text');
                             if (textEl && textEl.textContent.trim() === '') {
@@ -522,6 +545,7 @@
                                 if (textFromServer) {
                                     textEl.textContent = textFromServer;
                                 } else {
+                                    console.log('[WS] llm_end: message empty, removing from DOM');
                                     llmMsgEl.remove();
                                     const divider = llmMsgEl.nextElementSibling;
                                     if (divider && divider.classList.contains('message-divider')) {
