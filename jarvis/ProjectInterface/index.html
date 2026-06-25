@@ -92,6 +92,7 @@
         let isPlaying = false;
         let currentAudioBuffer = null;
         let audioContextForPlayback = null;
+        let audioSource = null;
         let expectedNextSeq = 0;
         let pendingAudioBuffers = [];
         let currentMessageSeq = 0;
@@ -299,18 +300,35 @@
         }
 
         // Audio playback with sequence-based ordering
-        function initPlaybackContext() {
+        async function initPlaybackContext() {
             if (!audioContextForPlayback) {
                 audioContextForPlayback = new (window.AudioContext || window.webkitAudioContext)();
+                console.log('[AUDIO] Created AudioContext, state:', audioContextForPlayback.state);
+            }
+            if (audioContextForPlayback.state === 'suspended') {
+                try {
+                    await audioContextForPlayback.resume();
+                    console.log('[AUDIO] AudioContext resumed, state:', audioContextForPlayback.state);
+                } catch (err) {
+                    console.error('[AUDIO] Failed to resume AudioContext:', err);
+                }
             }
         }
 
-        function enqueueAudioChunk(base64Data, seq) {
-            if (!base64Data) return;
+        async function enqueueAudioChunk(base64Data, seq) {
+            if (!base64Data) {
+                console.log('[AUDIO] enqueueAudioChunk: no data, skipping');
+                return;
+            }
+            console.log('[AUDIO] enqueueAudioChunk: seq=', seq, 'dataLen=', base64Data.length);
             
-            initPlaybackContext();
+            await initPlaybackContext();
             if (audioContextForPlayback.state === 'suspended') {
-                audioContextForPlayback.resume();
+                try {
+                    await audioContextForPlayback.resume();
+                } catch (err) {
+                    console.error('[AUDIO] Failed to resume:', err);
+                }
             }
 
             const binaryString = atob(base64Data);
@@ -319,37 +337,58 @@
                 uint8[i] = binaryString.charCodeAt(i);
             }
             const samples = new Float32Array(uint8.buffer, uint8.byteOffset, uint8.byteLength / 4);
+            console.log('[AUDIO] Decoded samples:', samples.length);
 
             const buffer = audioContextForPlayback.createBuffer(1, samples.length, 16000);
             buffer.getChannelData(0).set(samples);
 
             pendingAudioBuffers.push({ buffer, seq });
+            console.log('[AUDIO] pendingAudioBuffers now has', pendingAudioBuffers.length, 'items');
             sortAndPlayPending();
         }
 
         function sortAndPlayPending() {
+            console.log('[AUDIO] sortAndPlayPending: pending=', pendingAudioBuffers.length, 'expected=', expectedNextSeq, 'queue=', audioQueue.length, 'playing=', isPlaying);
             if (pendingAudioBuffers.length === 0) {
+                console.log('[AUDIO] sortAndPlayPending: no pending, returning');
                 return;
             }
 
             pendingAudioBuffers.sort((a, b) => a.seq - b.seq);
+            console.log('[AUDIO] sorted pending first item seq:', pendingAudioBuffers[0]?.seq);
 
+            let moved = 0;
             while (pendingAudioBuffers.length > 0 && pendingAudioBuffers[0].seq === expectedNextSeq) {
                 const item = pendingAudioBuffers.shift();
                 audioQueue.push(item.buffer);
                 expectedNextSeq++;
+                moved++;
             }
+            console.log('[AUDIO] moved', moved, 'items to queue. expectedNextSeq now:', expectedNextSeq, 'queue now:', audioQueue.length, 'pending now:', pendingAudioBuffers.length);
 
             if (!isPlaying && audioQueue.length > 0) {
-                playNextBuffer();
+                console.log('[AUDIO] starting playNextBuffer');
+                playNextBuffer().catch(e => console.error('[AUDIO] playNextBuffer error:', e));
             }
         }
 
-        function playNextBuffer() {
+        async function playNextBuffer() {
+            console.log('[AUDIO] playNextBuffer: queue=', audioQueue.length, 'contextState=', audioContextForPlayback ? audioContextForPlayback.state : 'none', 'dest=', audioContextForPlayback ? audioContextForPlayback.destination : 'none');
             if (audioQueue.length === 0) {
+                console.log('[AUDIO] playNextBuffer: queue empty, stopping');
                 isPlaying = false;
                 llmStatus.textContent = 'Idle';
                 return;
+            }
+
+            // Ensure context is running
+            if (audioContextForPlayback && audioContextForPlayback.state === 'suspended') {
+                try {
+                    await audioContextForPlayback.resume();
+                    console.log('[AUDIO] Context resumed in playNextBuffer');
+                } catch (err) {
+                    console.error('[AUDIO] Failed to resume in playNextBuffer:', err);
+                }
             }
 
             isPlaying = true;
@@ -357,6 +396,7 @@
             startBtn.classList.add('speaking');
 
             currentAudioBuffer = audioQueue.shift();
+            console.log('[AUDIO] playing buffer with', currentAudioBuffer ? currentAudioBuffer.length : 0, 'samples');
             if (audioSource) {
                 try { audioSource.stop(); } catch(e) {}
             }
@@ -365,16 +405,19 @@
             audioSource.buffer = currentAudioBuffer;
             audioSource.connect(audioContextForPlayback.destination);
 
-            audioSource.onended = () => {
+            audioSource.onended = async () => {
+                console.log('[AUDIO] audioSource.onended fired');
                 audioSource = null;
                 currentAudioBuffer = null;
-                playNextBuffer();
+                await playNextBuffer().catch(e => console.error('[AUDIO] playNextBuffer error:', e));
             };
 
             audioSource.start();
+            console.log('[AUDIO] audioSource.start() called');
         }
 
         function stopPlayback() {
+            console.log('[AUDIO] stopPlayback called, queue=', audioQueue.length, 'pending=', pendingAudioBuffers.length, 'playing=', isPlaying);
             if (audioSource) {
                 try { audioSource.stop(); } catch(e) {}
                 audioSource = null;
@@ -388,6 +431,7 @@
             previousTurnId = 0;
             llmStatus.textContent = 'Idle';
             startBtn.classList.remove('speaking');
+            console.log('[AUDIO] stopPlayback done');
         }
 
       function resetConversation() {
@@ -423,6 +467,7 @@
 
             ws.onmessage = (event) => {
                 const data = JSON.parse(event.data);
+                console.log('[WS] Received message:', data.type, data);
 
                 switch (data.type) {
                     case 'user_transcript':
@@ -471,15 +516,30 @@
                           break;
 
                     case 'llm_audio':
+                        console.log('[AUDIO] Received llm_audio:', {
+                            turn_id: data.turn_id,
+                            audio_seq: data.audio_seq,
+                            audio_len: data.audio ? data.audio.length : 0,
+                            audio_sample: data.audio ? data.audio.substring(0, 100) : 'none',
+                            expectedNextSeq,
+                            currentTurnId,
+                            previousTurnId,
+                            pendingAudioBuffers: pendingAudioBuffers.length,
+                            audioQueue: audioQueue.length,
+                            isPlaying
+                        });
                         if (data.turn_id !== undefined) {
-                            if (data.turn_id !== previousTurnId && data.turn_id !== currentTurnId + 1) {
+                            if (data.turn_id !== currentTurnId) {
+                                console.log('[AUDIO] Turn switch detected:', { oldTurnId: currentTurnId, newTurnId: data.turn_id });
                                 clearPendingAudioBuffers();
                                 previousTurnId = currentTurnId;
                             }
                             currentTurnId = data.turn_id;
                         }
                         const audioSeq = data.audio_seq !== undefined ? data.audio_seq : expectedNextSeq;
+                        console.log('[AUDIO] About to enqueue:', { seq: audioSeq, expectedNextSeq, bufferLen: data.audio?.length });
                         enqueueAudioChunk(data.audio, audioSeq);
+                        console.log('[AUDIO] After enqueue:', { expectedNextSeq, audioQueue: audioQueue.length, pendingAudioBuffers: pendingAudioBuffers.length });
                         break;
 
                     case 'user_start':
@@ -532,6 +592,7 @@
                     case 'llm_end':
                         console.log('[WS] llm_end: received', { turn_id: data.turn_id, activeLlmMessageId, llmMessageCount });
                         llmStatus.textContent = 'Idle';
+                        console.log('[AUDIO] llm_end: currentTurnId=', currentTurnId, 'previousTurnId=', previousTurnId, 'expectedNextSeq=', expectedNextSeq, 'pending=', pendingAudioBuffers.length, 'queue=', audioQueue.length);
                         if (data.turn_id) {
                             previousTurnId = data.turn_id;
                         }
@@ -567,6 +628,7 @@
                         break;
 
                     case 'audio_complete':
+                        console.log('[AUDIO] audio_complete received:', { turn_id: data.turn_id });
                         if (data.turn_id) {
                             previousTurnId = data.turn_id;
                         }

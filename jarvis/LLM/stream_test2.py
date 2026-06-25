@@ -49,7 +49,8 @@ async def stream_response_async():
                             delta = choices[0].get('delta', {})
                             
                             # Support standard content or reasoning tags (common in newer models)
-                            token = delta.get('content', '') or delta.get('reasoning_content', '')
+                            # here you select to view the thinking or not
+                            token = delta.get('content', '') # or delta.get('reasoning_content', '')
                             
                             if token:
                                 print(token, end="", flush=True)

@@ -162,6 +162,7 @@ class VADProcessor:
                 if not self.is_speaking:
                     self.is_speaking = True
                     self.speech_ended = False
+                    logger.info("Detected start of speech")
                     messages.append(
                         {
                             "type": "vad_result",
@@ -181,16 +182,6 @@ class VADProcessor:
 
                 # Check if silence duration exceeds threshold
                 if self.silence_sample_count >= self.silence_threshold_samples:
-                    self.is_speaking = False
-                    self.speech_ended = True
-                    messages.append(
-                        {
-                            "type": "vad_result",
-                            "silence": True,
-                            "chunk_id": self.chunk_id,
-                        }
-                    )
-
                     # Send accumulated speech buffer as one message
                     if self.speech_buffer:
                         full_audio = np.concatenate(self.speech_buffer)
@@ -205,6 +196,18 @@ class VADProcessor:
                         )
                         self.speech_buffer = []
                         self.speech_sample_count = 0
+
+                    self.is_speaking = False
+                    self.speech_ended = True
+                    logger.info("Detected end of speech")
+                    messages.append(
+                        {
+                            "type": "vad_result",
+                            "speech": False,
+                            "chunk_id": self.chunk_id,
+                        }
+                    )
+
                 else:
                     # Still accumulating speech - send window individually
                     messages.append(
@@ -228,7 +231,7 @@ class VADProcessor:
                     messages.append(
                         {
                             "type": "vad_result",
-                            "silence": True,
+                            "speech": False,
                             "chunk_id": self.chunk_id,
                         }
                     )
@@ -288,14 +291,16 @@ async def handle_vad_connection(websocket, vad_processor):
                         # base64-encoded audio from browser via server
                         audio_b64 = data.get("audio", "")
                         audio_bytes = base64.b64decode(audio_b64)
-                        logger.info(f"Received audio_chunk chunk_id={data.get('chunk_id')} size={len(audio_bytes)}")
+                        #logger.info(f"Received audio_chunk chunk_id={data.get('chunk_id')} size={len(audio_bytes)}")
                         vad_messages = vad_processor.process_audio(audio_bytes)
-                        logger.info(f"VAD processed, sending {len(vad_messages)} messages")
-                        for msg in vad_messages:
-                            await websocket.send(json.dumps(msg))
-                        continue
+                        
+                        if len(vad_messages) > 0:
+                            logger.info(f"VAD processed, sending {len(vad_messages)} messages")
+                            for msg in vad_messages:
+                                await websocket.send(json.dumps(msg))
+                            continue
 
-                    logger.info(f"Unknown VAD message type: {msg_type}")
+                    #logger.info(f"Unknown VAD message type: {msg_type}")
                     continue
 
                 # Binary message: raw audio Int16 chunk (from browser)

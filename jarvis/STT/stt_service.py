@@ -9,7 +9,6 @@ Protocol (client -> server):
 
 Protocol (server -> client):
   - audio_chunk: Base64-encoded audio with chunk_id
-  - end_of_speech: Silence detected, transcribe the buffer
 
 STT output sent to server (and forwarded to LLM/browser):
   - partial_transcript: Ongoing transcription with text and chunk_id
@@ -212,6 +211,7 @@ async def handle_stt(websocket, stt_service):
                     msg = json.loads(message)
 
                 msg_type = msg.get("type")
+                logger.info(f'msg.get("type"): {msg.get("type")}, msg.get("speech"): {msg.get("speech")}')
 
                 if msg_type == "audio_chunk":
                     audio_b64 = msg.get("audio")
@@ -244,7 +244,7 @@ async def handle_stt(websocket, stt_service):
                                 logger.info(f"STT sent final_transcript to server (deferred from end_of_speech)")
                         stt_service.samples_since_last_partial = 0
 
-                elif msg_type == "end_of_speech":
+                elif msg_type == "vad_result" and msg.get("speech") == False:
                     logger.info(f"End of speech, buffer size: {len(stt_service.audio_buffer)}")
                     if len(stt_service.audio_buffer) == 0:
                         waiting_for_audio_after_eos = True

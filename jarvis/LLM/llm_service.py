@@ -91,6 +91,7 @@ async def handle_llm(websocket, llm_info):
 
                 if msg_type == "user_input":
                     user_text = msg.get("text", "")
+                    print(f"user_text: {user_text}")
                     if not user_text.strip():
                         continue
                         
@@ -183,7 +184,8 @@ async def handle_llm(websocket, llm_info):
                                             delta = choices[0].get('delta', {})
 
                                             # Support standard content or reasoning tags (common in newer models)
-                                            token = delta.get('content', '') or delta.get('reasoning_content', '')
+                                            # enable to disable thinking
+                                            token = delta.get('content', '')# or delta.get('reasoning_content', '')
 
                                             if token:
                                                 llm_msg+=token

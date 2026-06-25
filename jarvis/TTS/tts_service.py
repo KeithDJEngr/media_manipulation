@@ -66,6 +66,10 @@ TTS_MAX_CHUNK_DURATION = float(os.getenv("TTS_MAX_CHUNK_DURATION", "3.0"))  # Ma
 SENTENCE_RE = re.compile(r'[.!?]\s+|[.!?]$')
 
 
+# Global vars
+global global_audio_seq
+
+
 class QwenTTSProcessor:
     """Qwen3-TTS processor with chunked streaming support.
 
@@ -504,9 +508,11 @@ async def handle_tts(websocket, tts_processor):
 
                     # Reset buffer on new complete response
                     if not partial:
+                        global_audio_seq = 0
                         tts_processor.reset_buffer(turn_id)
 
                     async def process_tts_input():
+                        nonlocal global_audio_seq
                         local_chunk_id = 0
 
                         def generate_chunks():
@@ -515,13 +521,15 @@ async def handle_tts(websocket, tts_processor):
                                     # Partial token - accumulate and process incrementally
                                     for chunk in tts_processor.accumulate_text(text, partial=True):
                                         if isinstance(chunk, dict):
-                                            logger.info(f"Queuing audio: {chunk}")
+                                            logger.info(f"Partial Queuing audio")
                                             chunk_queue.put_nowait(chunk)
+                                            logger.info(f"... Queued audio")
                                 else:
                                     # Complete response - process sentence by sentence in order
                                     for chunk in tts_processor.generate_sentences_in_order(text):
-                                        logger.info(f"Queuing audio: {chunk}")
+                                        logger.info(f"Complete Queuing audio")
                                         chunk_queue.put_nowait(chunk)
+                                        logger.info(f"... Queued audio")
                             except Exception as e:
                                 logger.error(f"Generation error: {e}")
                             generation_complete.set()
@@ -537,7 +545,7 @@ async def handle_tts(websocket, tts_processor):
                                 global_audio_seq += 1
                                 chunk["turn_id"] = tts_processor.current_turn_id
                                 await websocket.send(json.dumps(chunk))
-                                logger.info(f"sending audio: {chunk}")
+                                logger.info(f"sending audio") #: {chunk}
                                 local_chunk_id += 1
                             except asyncio.TimeoutError:
                                 continue
@@ -569,6 +577,7 @@ async def handle_tts(websocket, tts_processor):
 
                     chunk_queue: asyncio.Queue = asyncio.Queue()
                     generation_complete = asyncio.Event()
+                    logger.info("starting task: process_tts_input()")
                     task = asyncio.create_task(process_tts_input())
                     task.add_done_callback(
                         lambda t: logger.error(f"TTS task error: {t.exception()}") if t.exception() else None

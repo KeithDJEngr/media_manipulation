@@ -344,6 +344,18 @@ async def handle_vad(websocket):
     await manager.register_vad(websocket, is_browser=True)
     await manager.set_service_active("vad", True)
     vad_chunk_id = 0
+    last_chunk_time = asyncio.get_event_loop().time()
+
+    async def audio_heartbeat():
+        while True:
+            await asyncio.sleep(10)
+            elapsed = asyncio.get_event_loop().time() - last_chunk_time
+            if elapsed > 15 and vad_chunk_id > 0:
+                logger.warning(f"VAD audio heartbeat: no chunks for {elapsed:.1f}s (last at chunk {vad_chunk_id})")
+            elif elapsed > 10 and vad_chunk_id == 0:
+                logger.warning(f"VAD audio heartbeat: {vad_chunk_id} chunks total, no chunks for {elapsed:.1f}s")
+
+    heartbeat_task = asyncio.create_task(audio_heartbeat())
 
     try:
         async for message in websocket:
@@ -358,12 +370,15 @@ async def handle_vad(websocket):
                         "audio": base64.b64encode(message).decode("ascii"),
                         "chunk_id": vad_chunk_id
                     })
+                    last_chunk_time = asyncio.get_event_loop().time()
 
             except json.JSONDecodeError:
                 logger.error("Invalid JSON from VAD")
     except Exception as e:
         logger.error(f"VAD error: {e}")
     finally:
+        heartbeat_task.cancel()
+        logger.info(f"Browser VAD disconnected: received {vad_chunk_id} audio chunks total")
         await manager.set_service_active("vad", False)
         await manager.unregister_vad(websocket)
 
@@ -393,6 +408,8 @@ async def handle_vad_service(websocket):
                         continue
 
                     if msg_type == "audio_chunk":
+                        vad_chunk_id_vad = data.get("chunk_id", "?")
+                        logger.info(f"VAD service -> Server: audio_chunk chunk_id={vad_chunk_id_vad} forwarding to STT")
                         await manager.set_service_active("vad", True)
                         await manager.set_service_active("stt", True)
                         await manager.broadcast_to_service("stt", {
@@ -401,11 +418,12 @@ async def handle_vad_service(websocket):
                             "chunk_id": data.get("chunk_id")
                         })
                     elif msg_type == "vad_result":
-                        if data.get("silence"):
+                        if data.get("speech") == False:
                             await manager.set_service_active("vad", True)
                             await manager.set_service_active("stt", True)
                             await manager.broadcast_to_service("stt", {
-                                "type": "end_of_speech",
+                                "type": "vad_result",
+                                "speech": False,
                                 "chunk_id": data.get("chunk_id")
                             })
                             await manager.broadcast_to_client({"type": "user_end"})
@@ -432,6 +450,20 @@ async def handle_stt(websocket):
     last_heartbeat = {}
     handler_cancel_scope = []
     heartbeat_task = await create_heartbeat_task(last_heartbeat, handler_cancel_scope)
+    stt_chunk_count = 0
+    last_audio_time = asyncio.get_event_loop().time()
+
+    async def stt_audio_heartbeat():
+        while True:
+            await asyncio.sleep(10)
+            elapsed = asyncio.get_event_loop().time() - last_audio_time
+            if elapsed > 15 and stt_chunk_count > 0:
+                logger.warning(f"STT audio heartbeat: no VAD chunks for {elapsed:.1f}s (last at chunk {stt_chunk_count})")
+            elif elapsed > 10 and stt_chunk_count == 0:
+                logger.warning(f"STT audio heartbeat: {stt_chunk_count} chunks total, no VAD chunks for {elapsed:.1f}s")
+
+    stt_heartbeat_task = asyncio.create_task(stt_audio_heartbeat())
+    handler_cancel_scope.append(stt_heartbeat_task)
     
     try:
         async for message in websocket:
@@ -446,6 +478,11 @@ async def handle_stt(websocket):
                 if msg_type == "heartbeat":
                     last_heartbeat["stt"] = asyncio.get_event_loop().time()
                     continue
+                    
+                if msg_type == "audio_chunk":
+                    stt_chunk_count += 1
+                    last_audio_time = asyncio.get_event_loop().time()
+                    logger.info(f"STT -> Server: received audio_chunk chunk_id={data.get('chunk_id')} from VAD (total: {stt_chunk_count})")
                     
                 if msg_type == "partial_transcript":
                     await manager.set_service_active("stt", True)
@@ -486,11 +523,11 @@ async def handle_stt(websocket):
                     # Replace the last user message (updated by partial) with the final text
                     # or append a new one if no partial was set yet
                     user_appended = False
-                    for i in range(len(manager.conversation_history) - 1, -1, -1):
-                        if manager.conversation_history[i]["role"] == "user":
-                            manager.conversation_history[i]["content"] = user_text
-                            user_appended = True
-                            break
+                    #for i in range(len(manager.conversation_history) - 1, -1, -1):
+                    #    if manager.conversation_history[i]["role"] == "user":
+                    #        manager.conversation_history[i]["content"] += "\n"+user_text
+                    #        user_appended = True
+                    #        break
                     if not user_appended:
                         manager.conversation_history.append({"role": "user", "content": user_text})
                     logger.info(f"STT conversation_history before forwarding to LLM: {json.dumps(manager.conversation_history, ensure_ascii=False)}")
@@ -511,6 +548,7 @@ async def handle_stt(websocket):
     finally:
         for t in handler_cancel_scope:
             t.cancel()
+        logger.info(f"STT disconnected: processed {stt_chunk_count} audio chunks total")
         await manager.set_service_active("stt", False)
         await manager.unregister_stt(websocket)
 
@@ -697,6 +735,7 @@ async def handle_tts(websocket):
                     continue
                 
                 if msg_type == "audio_chunk":
+                    logger.info("TTS received and broadcasting audio chunk")
                     await manager.set_service_active("tts", True)
                     await manager.broadcast_to_client({
                         "type": "llm_audio",
@@ -706,6 +745,7 @@ async def handle_tts(websocket):
                     })
                     
                 elif msg_type == "audio_end":
+                    logger.info("TTS received and broadcasting audio end")
                     await manager.set_service_active("tts", False)
                     await manager.broadcast_to_client({
                         "type": "audio_complete",
