@@ -31,6 +31,8 @@ class ConnectionManager:
         self.llm_ws = None  # Legacy alias for backward compatibility
         self.tts_ws = None
         self.conversation_history = []
+        self.max_history_messages = 20
+        self.use_full_history = True
         self.service_status = {
             "vad": "offline",
             "stt": "offline",
@@ -212,6 +214,13 @@ class ConnectionManager:
             "status": status,
         })
 
+    def truncate_conversation_history(self):
+        """Truncate conversation history to prevent it from growing too large."""
+        if len(self.conversation_history) > self.max_history_messages:
+            excess = len(self.conversation_history) - self.max_history_messages
+            logger.info(f"Truncating conversation history: removing {excess} messages (limit: {self.max_history_messages})")
+            self.conversation_history = self.conversation_history[-self.max_history_messages:]
+
 
 async def create_heartbeat_task(last_heartbeat, handler_cancel_scope):
     """Create a task that checks for heartbeat timeout per service.
@@ -341,6 +350,9 @@ async def handle_client_message(data, websocket):
         system_prompt = data.get("system_prompt")
         wake_word = data.get("wake_word")
         tts_instruct = data.get("tts_instruct")
+        use_full_history = data.get("use_full_history")
+        manager.use_full_history = use_full_history if use_full_history is not None else True
+        logger.info(f"Message history mode: {'full' if manager.use_full_history else 'latest only'}")
 
         if voice:
             if manager.tts_ws and manager.tts_ws.state.name == "OPEN":
@@ -562,6 +574,7 @@ async def handle_stt(websocket):
                     if not found_user:
                         manager.conversation_history.append({"role": "user", "content": partial_text})
                         logger.info("Created new user entry in conversation_history for partial: '%s'", partial_text)
+                    manager.truncate_conversation_history()
                     # Also forward partial to LLM service if it's actively generating
                     ws_to_send = manager.llm_service_ws if manager.llm_service_ws else manager.llm_ws
                     if ws_to_send and ws_to_send.state.name == "OPEN":
@@ -594,6 +607,7 @@ async def handle_stt(websocket):
                     if not found_user:
                         manager.conversation_history.append({"role": "user", "content": user_text})
                         logger.info("Created new user entry in conversation_history for final transcript: '%s'", user_text)
+                    manager.truncate_conversation_history()
                     logger.info(f"STT conversation_history before forwarding to LLM: {json.dumps(manager.conversation_history, ensure_ascii=False)}")
                     # Forward directly to LLM service (not through browser /llm endpoint)
                     ws_to_send = manager.llm_service_ws if manager.llm_service_ws else manager.llm_ws
@@ -666,6 +680,11 @@ async def handle_llm(websocket):
                         "turn_id": current_turn_id,
                         "text": accumulated_llm_text,
                     })
+                    # Add LLM response to conversation history
+                    if accumulated_llm_text.strip():
+                        manager.conversation_history.append({"role": "assistant", "content": accumulated_llm_text})
+                        logger.info(f"Added LLM response to conversation_history: '{accumulated_llm_text[:80]}...'")
+                        manager.truncate_conversation_history()
                     # Send complete accumulated text to TTS for sentence-level processing
                     if accumulated_llm_text.strip():
                         await manager.forward_message("llm", "tts", {

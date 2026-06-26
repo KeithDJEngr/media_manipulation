@@ -106,6 +106,7 @@ class ParakeetSTT:
         self.audio_buffer = np.array([], dtype=np.float32)
         self.samples_since_last_partial = 0
         self.max_buffer_samples = int(30 * SAMPLE_RATE)  # 30 seconds max buffer
+        self.is_muted = False
 
     def add_audio_chunk(self, audio_bytes):
         """Add an audio chunk to the buffer.
@@ -171,6 +172,25 @@ class ParakeetSTT:
     def clear_buffer(self):
         """Clear the audio buffer without transcribing."""
         self.audio_buffer = np.array([], dtype=np.float32)
+
+    def check_wake_word(self, text):
+        """Check if the transcript starts with a mute/unmute command.
+        
+        Args:
+            text: The transcribed text
+            
+        Returns:
+            str: 'mute', 'unmute', or None
+        """
+        import re
+        text_lower = text.lower().strip()
+        # Strip trailing punctuation from the first word
+        first_word = re.split(r'[\s\.!,;:\?]+', text_lower)[0]
+        first_word = first_word.strip('.,!?;:')
+        if first_word in ('mute', 'unmute'):
+            logger.info(f"keyword {first_word} found")
+            return first_word
+        return None
 
 
 async def handle_stt(websocket, stt_service):
@@ -242,41 +262,45 @@ async def handle_stt(websocket, stt_service):
                     last_chunk_time = asyncio.get_event_loop().time()
                     stt_service.samples_since_last_partial += len(audio_bytes) // 2
                     logger.info(f"Added audio chunk, buffer size: {len(stt_service.audio_buffer)}, samples since last partial: {stt_service.samples_since_last_partial}")
+                    
                     if stt_service.samples_since_last_partial >= 1024:
                         logger.info("Triggering transcribe_partial on buffer size: %d", len(stt_service.audio_buffer))
                         partial_text = stt_service.transcribe_partial()
                         logger.info("transcribe_partial returned: '%s'", partial_text)
                         chunk_id = msg.get("chunk_id", 0)
-                        await websocket.send(json.dumps({
-                            "type": "partial_transcript",
-                            "text": partial_text,
-                            "chunk_id": chunk_id,
-                        }))
-                        logger.info(f"Sent partial_transcript: '{partial_text}'")
-                        if waiting_for_audio_after_eos:
-                            waiting_for_audio_after_eos = False
-                            if partial_text:
-                                await websocket.send(json.dumps({
-                                    "type": "final_transcript",
-                                    "text": partial_text,
-                                    "final": True,
-                                    "chunk_id": chunk_id,
-                                }))
-                                logger.info(f"STT sent final_transcript to server (deferred from end_of_speech)")
-                                stt_service.clear_buffer()
-                            else:
-                                # Buffer has data but partial returned empty - check if buffer is getting too large
-                                if len(stt_service.audio_buffer) >= 5120:
-                                    logger.info(f"Buffer too large ({len(stt_service.audio_buffer)} samples) while waiting, sending empty final")
+                        
+                        # Only send partials if not muted
+                        if not stt_service.is_muted:
+                            await websocket.send(json.dumps({
+                                "type": "partial_transcript",
+                                "text": partial_text,
+                                "chunk_id": chunk_id,
+                            }))
+                            logger.info(f"Sent partial_transcript: '{partial_text}'")
+                            if waiting_for_audio_after_eos:
+                                waiting_for_audio_after_eos = False
+                                if partial_text:
                                     await websocket.send(json.dumps({
                                         "type": "final_transcript",
-                                        "text": "",
+                                        "text": partial_text,
                                         "final": True,
                                         "chunk_id": chunk_id,
                                     }))
+                                    logger.info(f"STT sent final_transcript to server (deferred from end_of_speech)")
                                     stt_service.clear_buffer()
                                 else:
-                                    stt_service.samples_since_last_partial = 0
+                                    # Buffer has data but partial returned empty - check if buffer is getting too large
+                                    if len(stt_service.audio_buffer) >= 5120:
+                                        logger.info(f"Buffer too large ({len(stt_service.audio_buffer)} samples) while waiting, sending empty final")
+                                        await websocket.send(json.dumps({
+                                            "type": "final_transcript",
+                                            "text": "",
+                                            "final": True,
+                                            "chunk_id": chunk_id,
+                                        }))
+                                        stt_service.clear_buffer()
+                                    else:
+                                        stt_service.samples_since_last_partial = 0
                         else:
                             stt_service.samples_since_last_partial = 0
 
@@ -292,26 +316,42 @@ async def handle_stt(websocket, stt_service):
                         if text:
                             chunk_id = msg.get("chunk_id", 0)
                             logger.info(f"STT transcription: \"{text}\"")
+                            # Check for wake word commands (mute/unmute)
+                            wake_word = stt_service.check_wake_word(text)
+                            if wake_word:
+                                if wake_word == 'mute':
+                                    stt_service.is_muted = True
+                                    logger.info("Wake word 'mute' detected - microphone muted")
+                                elif wake_word == 'unmute':
+                                    stt_service.is_muted = False
+                                    logger.info("Wake word 'unmute' detected - microphone unmuted")
+                                # Send a special message to the browser to update UI
+                                await websocket.send(json.dumps({
+                                    "type": "wake_word",
+                                    "command": wake_word,
+                                }))
                             # Send final transcript to LLM
-                            await websocket.send(json.dumps({
-                                "type": "final_transcript",
-                                "text": text,
-                                "final": True,
-                                "chunk_id": chunk_id,
-                            }))
-                            logger.info(f"STT sent final_transcript to server")
+                            if not stt_service.is_muted:
+                                await websocket.send(json.dumps({
+                                    "type": "final_transcript",
+                                    "text": text,
+                                    "final": True,
+                                    "chunk_id": chunk_id,
+                                }))
+                                logger.info(f"STT sent final_transcript to server")
                         # Clear partial text on end of speech
                         stt_service.clear_buffer()
 
                 elif msg_type == "partial":
                     # Partial transcription request (for streaming)
                     text = stt_service.transcribe_partial()
-                    if text:
-                        await websocket.send(json.dumps({
-                            "type": "partial_transcript",
-                            "text": text,
-                            "chunk_id": msg.get("chunk_id", 0),
-                        }))
+                    if not stt_service.is_muted:
+                        if text:
+                            await websocket.send(json.dumps({
+                                "type": "partial_transcript",
+                                "text": text,
+                                "chunk_id": msg.get("chunk_id", 0),
+                            }))
 
             except json.JSONDecodeError as e:
                 logger.error(f"Invalid JSON from server: {e}")

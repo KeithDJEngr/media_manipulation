@@ -45,6 +45,8 @@ SYSTEM_PROMPT = os.getenv(
     "Keep responses concise but informative and conversational.",
 )
 
+use_full_history = True
+
 
 async def handle_llm(websocket, llm_info):
     """Handle the LLM WebSocket connection."""
@@ -96,6 +98,13 @@ async def handle_llm(websocket, llm_info):
                         logger.info(f"System prompt updated to: {new_prompt[:80]}...")
                     continue
 
+                if msg_type == "set_settings":
+                    if "use_full_history" in msg:
+                        global use_full_history
+                        use_full_history = msg["use_full_history"]
+                        logger.info(f"Message history mode set to: {'full' if use_full_history else 'latest only'}")
+                    continue
+
                 if msg_type == "user_input":
                     user_text = msg.get("text", "")
                     print(f"user_text: {user_text}")
@@ -145,8 +154,21 @@ async def handle_llm(websocket, llm_info):
 
 
 
-                    # Build messages list with full conversation history (user text already in history from server)
-                    messages = conversation_history.copy()
+                    # Build messages list with conversation history (respecting use_full_history setting)
+                    if use_full_history:
+                        messages = conversation_history.copy()
+                    else:
+                        # Only use system prompt and latest user/assistant exchange
+                        messages = [conversation_history[0]]  # System prompt
+                        # Find the last user message
+                        for i in range(len(conversation_history) - 1, -1, -1):
+                            if conversation_history[i]["role"] == "user":
+                                messages.append(conversation_history[i])
+                                # Include the next assistant message if it exists
+                                if i + 1 < len(conversation_history) and conversation_history[i + 1]["role"] == "assistant":
+                                    messages.append(conversation_history[i + 1])
+                                break
+                        logger.info(f"Using latest-only mode: {len(messages)} messages")
 
                     payload = {
                         "model": llm_info['model'],
@@ -214,15 +236,6 @@ async def handle_llm(websocket, llm_info):
 
 
 
-
-                    #    await websocket.send(json.dumps({"type": "llm_token", "text": token, "partial": True}))
-                    #    logger.info(f"LLM token: {token}")
-                    #    last_token = token
-                    #if last_token:
-                    #    llm_service.history.append({"role": "assistant", "content": last_token})
-
-
-
                     # Add to conversation history (user message already in history from server)
                     conversation_history.append({"role": "assistant", "content": llm_msg})
 
@@ -243,17 +256,17 @@ async def handle_llm(websocket, llm_info):
                     else:
                         logger.info("LLM generation complete (empty response)")
 
-                #elif msg_type == "reset":
-                #    # Reset conversation history
-                #    llm_service.history.clear()
-                #    llm_service.history.append({"role": "system", "content": SYSTEM_PROMPT})
-                #    logger.info("LLM conversation reset")
-                #
-                #elif msg_type == "set_system_prompt":
-                #    new_prompt = msg.get("prompt", "")
-                #    if new_prompt:
-                #        llm_service.history[0] = {"role": "system", "content": new_prompt}
-                #        logger.info("System prompt updated")
+                elif msg_type == "reset":
+                    # Reset conversation history
+                    llm_service.history.clear()
+                    llm_service.history.append({"role": "system", "content": SYSTEM_PROMPT})
+                    logger.info("LLM conversation reset")
+                
+                elif msg_type == "set_system_prompt":
+                    new_prompt = msg.get("prompt", "")
+                    if new_prompt:
+                        llm_service.history[0] = {"role": "system", "content": new_prompt}
+                        logger.info("System prompt updated")
 
             except json.JSONDecodeError as e:
                 logger.error(f"Invalid JSON from server: {e}")

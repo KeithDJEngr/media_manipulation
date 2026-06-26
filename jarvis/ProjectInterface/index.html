@@ -10,6 +10,7 @@
     <div class="container">
         <div class="controls-pane">
             <div class="controls-left">
+                <button id="mute-btn" title="Mute/Unmute microphone">🎤</button>
                 <button id="start-btn">Start</button>
                 <div class="status" id="user-status">Inactive</div>
             </div>
@@ -74,6 +75,14 @@
                         <textarea id="system-prompt" rows="4" placeholder="Enter custom system prompt..." oninput="updateSetting('system_prompt', this.value)"></textarea>
                     </div>
                     <div class="settings-group">
+                        <h3>Message History</h3>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="use-full-history" onchange="updateSetting('use_full_history', this.checked)" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
+                        <span class="toggle-label">Use full conversation history (disable for faster responses with limited context)</span>
+                    </div>
+                    <div class="settings-group">
                         <h3>Wake Word Detection</h3>
                         <label class="toggle-switch">
                             <input type="checkbox" id="wake-word-toggle" onchange="updateSetting('wake_word', this.checked)">
@@ -91,6 +100,8 @@
     </div>
 
     <script>
+        const sleep = ms => new Promise(res => setTimeout(res, ms));
+
         const HEARTBEAT_TIMEOUT = 15000;
         const serviceHeartbeatTimers = { vad: null, stt: null, llm: null, tts: null };
         const serviceLastHeartbeat = { vad: 0, stt: 0, llm: 0, tts: 0 };
@@ -313,6 +324,45 @@
              }
          }
 
+        let actualSampleRate = 16000;
+        let isMuted = false;
+        let audioResampleAccumulator = null;
+        const VAD_WINDOW_SIZE = 512;
+
+        function resampleAudio(inputBuffer, outputSampleRate) {
+            const inputSampleRate = audioContext.sampleRate;
+            const inputLength = inputBuffer.length;
+            const outputLength = Math.floor(inputLength * outputSampleRate / inputSampleRate);
+            
+            if (outputLength <= 0) return inputBuffer;
+            
+            const outputBuffer = new Float32Array(outputLength);
+            const ratio = inputSampleRate / outputSampleRate;
+            
+            for (let i = 0; i < outputLength; i++) {
+                const sourceIndex = i * ratio;
+                const sourceIndexInt = Math.floor(sourceIndex);
+                const sourceIndexFrac = sourceIndex - sourceIndexInt;
+                
+                if (sourceIndexInt + 1 < inputBuffer.length) {
+                    outputBuffer[i] = inputBuffer[sourceIndexInt] * (1 - sourceIndexFrac) + 
+                                     inputBuffer[sourceIndexInt + 1] * sourceIndexFrac;
+                } else {
+                    outputBuffer[i] = inputBuffer[sourceIndexInt] || 0;
+                }
+            }
+            return outputBuffer;
+        }
+
+        function sendInt16Chunk(data) {
+            const int16Data = new Int16Array(data.length);
+            for (let i = 0; i < data.length; i++) {
+                const s = Math.max(-1, Math.min(1, data[i]));
+                int16Data[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+            ws.send(int16Data.buffer);
+        }
+
         // Audio capture
         async function startAudioCapture() {
             if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -320,13 +370,15 @@
                 return;
             }
             try {
-                audioContext = new (window.AudioContext || window.webkitAudioContext)({
-                    sampleRate: 16000
-                });
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                actualSampleRate = audioContext.sampleRate;
+                console.log('[AUDIO] AudioContext created with sample rate:', actualSampleRate);
+                
+                audioResampleAccumulator = new Float32Array(0);
+                
                 mediaStream = await navigator.mediaDevices.getUserMedia({
                     audio: {
                         channelCount: 1,
-                        sampleRate: 16000,
                         echoCancellation: true,
                         noiseSuppression: true,
                         autoGainControl: true
@@ -334,25 +386,37 @@
                 });
 
                 const source = audioContext.createMediaStreamSource(mediaStream);
-                processor = audioContext.createScriptProcessor(1024, 1, 1);
+                processor = audioContext.createScriptProcessor(512, 1, 1);
 
                 processor.onaudioprocess = (e) => {
                     if (!ws || ws.readyState !== WebSocket.OPEN) return;
+                    if (isMuted) return;
+                    
                     const inputData = e.inputBuffer.getChannelData(0);
-                    const float32Data = new Float32Array(inputData.length);
-                    for (let i = 0; i < inputData.length; i++) {
-                        float32Data[i] = inputData[i];
+                    
+                    if (actualSampleRate !== 16000) {
+                        const resampled = resampleAudio(inputData, 16000);
+                        const newAccum = new Float32Array(audioResampleAccumulator.length + resampled.length);
+                        newAccum.set(audioResampleAccumulator);
+                        newAccum.set(resampled, audioResampleAccumulator.length);
+                        audioResampleAccumulator = newAccum;
+                    } else {
+                        const newAccum = new Float32Array(audioResampleAccumulator.length + inputData.length);
+                        newAccum.set(audioResampleAccumulator);
+                        newAccum.set(inputData, audioResampleAccumulator.length);
+                        audioResampleAccumulator = newAccum;
                     }
-                    const int16Data = new Int16Array(float32Data.length);
-                    for (let i = 0; i < float32Data.length; i++) {
-                        const s = Math.max(-1, Math.min(1, float32Data[i]));
-                        int16Data[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                    
+                    while (audioResampleAccumulator.length >= VAD_WINDOW_SIZE) {
+                        const chunk = audioResampleAccumulator.slice(0, VAD_WINDOW_SIZE);
+                        audioResampleAccumulator = audioResampleAccumulator.slice(VAD_WINDOW_SIZE);
+                        sendInt16Chunk(chunk);
                     }
-                    ws.send(int16Data.buffer);
                 };
 
                 source.connect(processor);
                 processor.connect(audioContext.destination);
+                console.log('[AUDIO] Audio capture started successfully');
             } catch (err) {
                 console.error('Audio capture error:', err);
                 let msg = 'Microphone error: ';
@@ -545,6 +609,7 @@
             system_prompt: '',
             wake_word: false,
             tts_instruct: 'Speak in a calm, natural conversational tone.',
+            use_full_history: true,
         };
 
         let settings = { ...defaultSettings };
@@ -599,6 +664,11 @@
                 wakeWordToggle.checked = settings.wake_word;
             }
 
+            const useFullHistoryToggle = document.getElementById('use-full-history');
+            if (useFullHistoryToggle) {
+                useFullHistoryToggle.checked = settings.use_full_history;
+            }
+
             if (ttsInstructInput) {
                 ttsInstructInput.value = settings.tts_instruct;
             }
@@ -625,6 +695,9 @@
                     ws.send(JSON.stringify(message));
                 } else if (key === 'tts_instruct') {
                     message.tts_instruct = value;
+                    ws.send(JSON.stringify(message));
+                } else if (key === 'use_full_history') {
+                    message.use_full_history = value;
                     ws.send(JSON.stringify(message));
                 }
             }
@@ -891,6 +964,25 @@
                         currentTurnId = 0;
                         previousTurnId = 0;
                         break;
+
+                    case 'wake_word':
+                        console.log('[WS] Wake word detected:', data.command);
+                        if (data.command === 'mute') {
+                            isMuted = true;
+                            if (muteBtn) {
+                                muteBtn.textContent = '🔇';
+                                muteBtn.title = 'Unmute microphone';
+                                muteBtn.classList.add('muted');
+                            }
+                        } else if (data.command === 'unmute') {
+                            isMuted = false;
+                            if (muteBtn) {
+                                muteBtn.textContent = '🎤';
+                                muteBtn.title = 'Mute microphone';
+                                muteBtn.classList.remove('muted');
+                            }
+                        }
+                        break;
                 }
             };
 
@@ -908,6 +1000,15 @@
                 console.error('VAD WebSocket error:', err);
             };
         }
+
+        const muteBtn = document.getElementById('mute-btn');
+        muteBtn.addEventListener('click', () => {
+            isMuted = !isMuted;
+            muteBtn.textContent = isMuted ? '🔇' : '🎤';
+            muteBtn.title = isMuted ? 'Unmute microphone' : 'Mute microphone';
+            muteBtn.classList.toggle('muted', isMuted);
+            console.log('[AUDIO] Microphone', isMuted ? 'muted' : 'unmuted');
+        });
 
         // Main toggle
         startBtn.addEventListener('click', async () => {

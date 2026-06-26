@@ -1,41 +1,45 @@
 # Current state
-The webpage works. It has a transcript with user messages and LLM responses. It has a strange voice responding slowly but it does respond.
+The webpage works. It has a transcript with user messages and LLM responses.
 
 # Completed tasks
 
-## Bugs
-- [ ] I just connected 
-- [x] STT stuck at starting - added timeout mechanism and fixed buffer clearing on speech end
-- [x] After streaming STT text it went blank - fixed VAD result handling and waiting_for_audio_after_eos state
-- [x] Audio from later messages played before earlier - fixed audio_seq per-turn tracking
-- [x] First partial message junk - fixed conversation_history update when no user message exists
-- [x] Partial transcripts not updating - STT now always sends partial_transcript (even empty)
-- [x] Mobile browser mic denied - added better error messages and audio processing options
-- [x] llm_start turn_id reset logic - fixed per-turn sequence offset tracking
-
-## Performance
-- [x] Speech takes long to generate - increased TTS chunk size, optimized generation parameters
-- [x] VAD rapid-fire utterance batching - added 0.5s speech end debounce
-- [x] TTS model warmup overhead - kept model loaded, reduced redundant generation, increased chunk thresholds
-
-## New features
-- [x] TTS voice selection UI control - dropdown with presets (eric, sarah, james, emma) and custom
-- [x] Wake word detection toggle - always-listening mode in settings
-- [x] Custom system prompt via UI - textarea in settings panel, sent to LLM service
-- [x] Audio quality settings (sample rate) - 16kHz/22.05kHz/44.1kHz selection
-- [x] Copy message to clipboard - per-message copy button with visual feedback
-- [x] Conversation export - export button downloads conversation as text file
-- [x] TTS voice instruct - configurable in settings panel
 
 # Remaining tasks
 
+## Review
+- [ ] Review the repo. Generate a summary of all the elements involved, how they work together, and all the functionality included in detail.
+
+## Bugs - spin up additional agents to handle these one at a time
+- [ ] Not sure if settings are changing anything or not. Review the logs and see if you can spot anything missing with getting the settings to .
+- [ ] Conversation history is not working. It just has the system and latest messages. Doesn't look like the LLM logs are showing it modified message history so it may be default false and working except UI or it may not be working.
+
+## Performance
+- [ ] Are there any broad changes to make the system more efficient?
+- [ ] What could be done to speed up the TTS or STT, especially STT? Are there other models, ways of retaining loading params, or anything that would still provide good quality but be faster?
+
+## New features
+
+## General
+
 ## Future TODOs
+
+### Bugs
+- [x] ???When the audio gets too long it appears to fail. Added conversation history truncation (max 20 messages) to prevent memory issues.
+- [x] ???STT didn't appear to work with my mobile browser. Added sample rate detection and resampling to handle mobile browsers.
 
 ### Improvements
 - [ ] Audio playback volume control in UI
 - [ ] Listening history panel separate from conversation
 - [ ] Multi-language support (current STT is English-only)
 - [ ] Conversation search
+
+### Performance
+- [x] Reviewed and implemented performance improvements:
+  - Added mobile browser sample rate detection and resampling
+  - Added conversation history truncation (max 20 messages) to prevent memory issues
+  - Added use_full_history toggle to reduce API payload size
+  - Reduced AudioContext buffer size from 1024 to 512 samples for lower latency
+  - Added wake word mute/unmute detection to skip audio processing
 
 ### New features
 - [ ] Wake word detection (actual keyword-based, not just always-listening mode)
