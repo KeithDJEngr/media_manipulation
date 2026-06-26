@@ -14,7 +14,10 @@
 #   LLM_MODEL: LLM model name for API calls (default: dummy)
 
 # Parse arguments
-HOST=${1:-${HOST:-0.0.0.0}}
+#HOST=${1:-${HOST:-0.0.0.0}}
+IP=$(hostname -i | awk '{print $1}')
+echo "IP: $IP"
+HOST=${1:-${IP:-0.0.0.0}}
 PORT=${2:-${PORT:-8765}}
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -79,17 +82,16 @@ trap cleanup SIGINT SIGTERM
 
 # Start server
 # Generate SSL cert for localhost and local IP
-mkcert -install
-CERT_ARGS=("localhost" "127.0.0.1" "::1")
-
-if [ "$HOST" = "0.0.0.0" ]; then
-    LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-    if [ -n "$LOCAL_IP" ]; then
-        CERT_ARGS+=("$LOCAL_IP")
+if [[ ! -e "localhost+2.pem" ]]; then
+    mkcert -install
+    CERT_ARGS=("localhost" "127.0.0.1" "::1")
+    
+    if [ -n "$IP" ]; then
+        CERT_ARGS+=("$IP")
     fi
+    mkcert "${CERT_ARGS[@]}"
 fi
 
-mkcert "${CERT_ARGS[@]}"
 
 # Configure nginx/caddy to terminate TLS and proxy :8765
 echo "Starting Jarvis server on port ${PORT}..."

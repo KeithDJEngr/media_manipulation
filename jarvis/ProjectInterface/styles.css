@@ -266,6 +266,187 @@
         user-select: none;
     }
 
+    .copy-btn {
+        position: absolute;
+        right: 8px;
+        bottom: 8px;
+        background: rgba(255, 255, 255, 0.1);
+        border: none;
+        border-radius: 4px;
+        padding: 4px 8px;
+        font-size: 12px;
+        cursor: pointer;
+        color: #888;
+        transition: all 0.2s;
+    }
+
+    .copy-btn:hover {
+        background: rgba(255, 255, 255, 0.2);
+        color: #fff;
+    }
+
+    .message-bubble {
+        position: relative;
+    }
+
+    /* Settings overlay */
+    .settings-overlay {
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: rgba(0, 0, 0, 0.8);
+        z-index: 1000;
+        justify-content: center;
+        align-items: center;
+    }
+
+    .settings-overlay.active {
+        display: flex;
+    }
+
+    .settings-panel {
+        background: #1a1a1a;
+        border-radius: 12px;
+        width: 90%;
+        max-width: 500px;
+        max-height: 80vh;
+        overflow-y: auto;
+        border: 1px solid #333;
+    }
+
+    .settings-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 16px 20px;
+        border-bottom: 1px solid #333;
+    }
+
+    .settings-header h2 {
+        margin: 0;
+        font-size: 18px;
+        color: #e0e0e0;
+    }
+
+    .settings-close {
+        background: none;
+        border: none;
+        color: #888;
+        font-size: 18px;
+        cursor: pointer;
+        padding: 4px 8px;
+        border-radius: 4px;
+    }
+
+    .settings-close:hover {
+        background: #333;
+        color: #fff;
+    }
+
+    .settings-content {
+        padding: 20px;
+    }
+
+    .settings-group {
+        margin-bottom: 24px;
+    }
+
+    .settings-group h3 {
+        margin: 0 0 12px 0;
+        font-size: 14px;
+        color: #aaa;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+    }
+
+    .settings-group select,
+    .settings-group input[type="text"],
+    .settings-group textarea {
+        width: 100%;
+        padding: 10px;
+        background: #2a2a2a;
+        border: 1px solid #444;
+        border-radius: 6px;
+        color: #e0e0e0;
+        font-size: 14px;
+        font-family: inherit;
+        box-sizing: border-box;
+    }
+
+    .settings-group select:focus,
+    .settings-group input[type="text"]:focus,
+    .settings-group textarea:focus {
+        outline: none;
+        border-color: #0af;
+    }
+
+    .settings-group textarea {
+        resize: vertical;
+        min-height: 60px;
+    }
+
+    .settings-group input[type="text"]::placeholder,
+    .settings-group textarea::placeholder {
+        color: #666;
+    }
+
+    /* Toggle switch */
+    .toggle-switch {
+        position: relative;
+        display: inline-block;
+        width: 50px;
+        height: 26px;
+        margin-right: 12px;
+    }
+
+    .toggle-switch input {
+        opacity: 0;
+        width: 0;
+        height: 0;
+    }
+
+    .toggle-slider {
+        position: absolute;
+        cursor: pointer;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background-color: #444;
+        transition: 0.3s;
+        border-radius: 26px;
+    }
+
+    .toggle-slider:before {
+        position: absolute;
+        content: "";
+        height: 20px;
+        width: 20px;
+        left: 3px;
+        bottom: 3px;
+        background-color: white;
+        transition: 0.3s;
+        border-radius: 50%;
+    }
+
+    .toggle-switch input:checked + .toggle-slider {
+        background-color: #0af;
+    }
+
+    .toggle-switch input:checked + .toggle-slider:before {
+        transform: translateX(24px);
+    }
+
+    .toggle-label {
+        display: inline-block;
+        font-size: 13px;
+        color: #888;
+        vertical-align: middle;
+    }
+
     @keyframes blink {
         0%, 100% { opacity: 1; }
         50% { opacity: 0.3; }

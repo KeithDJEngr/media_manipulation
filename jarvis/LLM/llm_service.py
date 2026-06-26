@@ -89,6 +89,13 @@ async def handle_llm(websocket, llm_info):
                     ]
                     continue
 
+                if msg_type == "set_system_prompt":
+                    new_prompt = msg.get("prompt", "")
+                    if new_prompt:
+                        conversation_history[0] = {"role": "system", "content": new_prompt}
+                        logger.info(f"System prompt updated to: {new_prompt[:80]}...")
+                    continue
+
                 if msg_type == "user_input":
                     user_text = msg.get("text", "")
                     print(f"user_text: {user_text}")
@@ -154,7 +161,7 @@ async def handle_llm(websocket, llm_info):
                         llm_msg=""
 
                         # Use AsyncClient with a 60s timeout (handles connect, read, and write delays)
-                        async with httpx.AsyncClient(timeout=60) as client:
+                        async with httpx.AsyncClient(timeout=240) as client:
 
                             # CRITICAL CHANGE: Use .stream("POST", ...) instead of .post()
                             # This forces httpx to handle the response as a stream immediately.

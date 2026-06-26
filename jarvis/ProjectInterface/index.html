@@ -16,6 +16,8 @@
             <div class="controls-right">
                 <div class="status" id="llm-status">Waiting</div>
                 <button id="reset-btn" onclick="resetConversation()">Reset</button>
+                <button id="export-btn" onclick="exportConversation()" title="Export conversation">Export</button>
+                <button id="settings-btn" onclick="toggleSettings()" title="Settings">⚙️</button>
             </div>
         </div>
         <div class="service-status-bar">
@@ -41,6 +43,51 @@
             </div>
         </div>
         <div class="conversation-pane" id="conversation-history"></div>
+        <div class="settings-overlay" id="settings-overlay" onclick="if(event.target===this)toggleSettings()">
+            <div class="settings-panel">
+                <div class="settings-header">
+                    <h2>Settings</h2>
+                    <button class="settings-close" onclick="toggleSettings()">✕</button>
+                </div>
+                <div class="settings-content">
+                    <div class="settings-group">
+                        <h3>TTS Voice</h3>
+                        <select id="tts-voice" onchange="updateSetting('tts_voice', this.value)">
+                            <option value="eric">Eric (Male)</option>
+                            <option value="sarah">Sarah (Female)</option>
+                            <option value="james">James (Male)</option>
+                            <option value="emma">Emma (Female)</option>
+                            <option value="custom">Custom...</option>
+                        </select>
+                        <input type="text" id="tts-voice-custom" placeholder="Custom speaker name" style="display:none;" oninput="updateSetting('tts_voice', this.value)">
+                    </div>
+                    <div class="settings-group">
+                        <h3>Audio Quality</h3>
+                        <select id="audio-sample-rate" onchange="updateSetting('sample_rate', this.value)">
+                            <option value="16000">16 kHz (Standard)</option>
+                            <option value="22050">22.05 kHz (Better)</option>
+                            <option value="44100">44.1 kHz (High)</option>
+                        </select>
+                    </div>
+                    <div class="settings-group">
+                        <h3>System Prompt</h3>
+                        <textarea id="system-prompt" rows="4" placeholder="Enter custom system prompt..." oninput="updateSetting('system_prompt', this.value)"></textarea>
+                    </div>
+                    <div class="settings-group">
+                        <h3>Wake Word Detection</h3>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="wake-word-toggle" onchange="updateSetting('wake_word', this.checked)">
+                            <span class="toggle-slider"></span>
+                        </label>
+                        <span class="toggle-label">Always-listening mode (when enabled, audio continues after speech ends)</span>
+                    </div>
+                    <div class="settings-group">
+                        <h3>TTS Voice Instruct</h3>
+                        <input type="text" id="tts-instruct" placeholder="e.g., Speak in a calm, natural tone" oninput="updateSetting('tts_instruct', this.value)">
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -98,6 +145,8 @@
         let currentMessageSeq = 0;
         let currentTurnId = 0;
         let previousTurnId = 0;
+        let lastAudioCompleteSeq = -1;
+        let turnSeqStart = {};
 
         // WebSocket connections
         const origin = window.location.origin.replace(/^http/, 'ws');
@@ -114,10 +163,11 @@
         let activeLlmMessageId = null;
 
         function appendUserMessage(text) {
+            userMessageCount++;
             const row = document.createElement('div');
             row.className = 'message-row user';
             row.id = `user-msg-${userMessageCount}`;
-            row.innerHTML = `<div class="message-bubble"><div class="message-label">User</div><div class="message-text">${escapeHtml(text)}</div></div>`;
+            row.innerHTML = `<div class="message-bubble"><div class="message-label">User</div><div class="message-text">${escapeHtml(text)}</div><button class="copy-btn" onclick="copyMessage('${row.id}')" title="Copy to clipboard">📋</button></div>`;
             conversationHistory.appendChild(row);
             conversationHistory.scrollTop = conversationHistory.scrollHeight;
         }
@@ -129,7 +179,7 @@
             row.id = `llm-msg-${llmMessageCount}`;
             activeLlmMessageId = row.id;
             console.log('[DOM] appendLLMMessage: creating', row.id, 'with textLen=', text.length);
-            row.innerHTML = `<div class="message-bubble"><div class="message-label">LLM</div><div class="message-text">${escapeHtml(text)}</div></div>`;
+            row.innerHTML = `<div class="message-bubble"><div class="message-label">LLM</div><div class="message-text">${escapeHtml(text)}</div><button class="copy-btn" onclick="copyMessage('${row.id}')" title="Copy to clipboard">📋</button></div>`;
             conversationHistory.appendChild(row);
             const divider = document.createElement('div');
             divider.className = 'message-divider';
@@ -147,7 +197,7 @@
                 const row = document.createElement('div');
                 row.className = 'message-row user';
                 row.id = `user-msg-${userMessageCount}`;
-                row.innerHTML = `<div class="message-bubble"><div class="message-label">User</div><div class="message-text">${escapeHtml(text)}</div></div>`;
+                row.innerHTML = `<div class="message-bubble"><div class="message-label">User</div><div class="message-text">${escapeHtml(text)}</div><button class="copy-btn" onclick="copyMessage('${row.id}')" title="Copy to clipboard">📋</button></div>`;
                 conversationHistory.appendChild(row);
                 lastUserMessageId = `user-msg-${userMessageCount}`;
                 msgEl = row;
@@ -155,6 +205,29 @@
             const textEl = msgEl.querySelector('.message-text');
             textEl.textContent = text;
             conversationHistory.scrollTop = conversationHistory.scrollHeight;
+        }
+
+        function copyMessage(elementId) {
+            const msgEl = document.getElementById(elementId);
+            if (!msgEl) return;
+            const textEl = msgEl.querySelector('.message-text');
+            if (!textEl) return;
+            const text = textEl.textContent || textEl.innerText;
+            navigator.clipboard.writeText(text).then(() => {
+                const btn = msgEl.querySelector('.copy-btn');
+                if (btn) {
+                    const original = btn.textContent;
+                    btn.textContent = '✅';
+                    setTimeout(() => { btn.textContent = original; }, 1500);
+                }
+            }).catch(() => {
+                const textarea = document.createElement('textarea');
+                textarea.value = text;
+                document.body.appendChild(textarea);
+                textarea.select();
+                document.execCommand('copy');
+                document.body.removeChild(textarea);
+            });
         }
 
         function finalizeUserMessage() {
@@ -219,7 +292,6 @@
 
         function clearPendingAudioBuffers() {
             pendingAudioBuffers = [];
-            expectedNextSeq = 0;
             currentTurnId = 0;
         }
 
@@ -244,7 +316,7 @@
         // Audio capture
         async function startAudioCapture() {
             if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-                alert('Microphone not supported in this browser.');
+                alert('Microphone not supported in this browser. Please use a modern browser with HTTPS or localhost.');
                 return;
             }
             try {
@@ -254,7 +326,10 @@
                 mediaStream = await navigator.mediaDevices.getUserMedia({
                     audio: {
                         channelCount: 1,
-                        sampleRate: 16000
+                        sampleRate: 16000,
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
                     }
                 });
 
@@ -280,7 +355,17 @@
                 processor.connect(audioContext.destination);
             } catch (err) {
                 console.error('Audio capture error:', err);
-                alert('Microphone access denied or error: ' + err.message);
+                let msg = 'Microphone error: ';
+                if (err.name === 'NotAllowedError') {
+                    msg += 'Permission denied. Please allow microphone access in your browser settings.';
+                } else if (err.name === 'NotFoundError') {
+                    msg += 'No microphone found. Please connect a microphone.';
+                } else if (err.name === 'SecurityError') {
+                    msg += 'Microphone access requires HTTPS or localhost.';
+                } else {
+                    msg += err.message || 'Unknown error';
+                }
+                alert(msg);
             }
         }
 
@@ -426,7 +511,6 @@
             pendingAudioBuffers = [];
             currentAudioBuffer = null;
             isPlaying = false;
-            expectedNextSeq = 0;
             currentTurnId = 0;
             previousTurnId = 0;
             llmStatus.textContent = 'Idle';
@@ -434,7 +518,7 @@
             console.log('[AUDIO] stopPlayback done');
         }
 
-      function resetConversation() {
+        function resetConversation() {
             if (ws && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({ type: 'reset' }));
             }
@@ -451,7 +535,138 @@
             previousTurnId = 0;
             activeLlmMessageId = null;
             lastUserMessageId = null;
+            turnSeqStart = {};
         }
+
+        // Settings management
+        const defaultSettings = {
+            tts_voice: 'eric',
+            sample_rate: 16000,
+            system_prompt: '',
+            wake_word: false,
+            tts_instruct: 'Speak in a calm, natural conversational tone.',
+        };
+
+        let settings = { ...defaultSettings };
+
+        function loadSettings() {
+            const saved = localStorage.getItem('jarvis_settings');
+            if (saved) {
+                try {
+                    const parsed = JSON.parse(saved);
+                    settings = { ...defaultSettings, ...parsed };
+                } catch (e) {
+                    console.warn('Failed to load settings:', e);
+                }
+            }
+            syncSettingsToUI();
+            applySettings();
+        }
+
+        function saveSettings() {
+            localStorage.setItem('jarvis_settings', JSON.stringify(settings));
+        }
+
+        function syncSettingsToUI() {
+            const voiceSelect = document.getElementById('tts-voice');
+            const voiceCustom = document.getElementById('tts-voice-custom');
+            const sampleRateSelect = document.getElementById('audio-sample-rate');
+            const systemPromptTextarea = document.getElementById('system-prompt');
+            const wakeWordToggle = document.getElementById('wake-word-toggle');
+            const ttsInstructInput = document.getElementById('tts-instruct');
+
+            if (voiceSelect && voiceCustom) {
+                const voiceOptions = ['eric', 'sarah', 'james', 'emma'];
+                if (voiceOptions.includes(settings.tts_voice)) {
+                    voiceSelect.value = settings.tts_voice;
+                    voiceCustom.style.display = 'none';
+                } else {
+                    voiceSelect.value = 'custom';
+                    voiceCustom.style.display = 'block';
+                    voiceCustom.value = settings.tts_voice;
+                }
+            }
+
+            if (sampleRateSelect) {
+                sampleRateSelect.value = settings.sample_rate.toString();
+            }
+
+            if (systemPromptTextarea) {
+                systemPromptTextarea.value = settings.system_prompt;
+            }
+
+            if (wakeWordToggle) {
+                wakeWordToggle.checked = settings.wake_word;
+            }
+
+            if (ttsInstructInput) {
+                ttsInstructInput.value = settings.tts_instruct;
+            }
+        }
+
+        function updateSetting(key, value) {
+            settings[key] = value;
+            saveSettings();
+            applySettings();
+
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                const message = { type: 'set_settings' };
+                if (key === 'tts_voice') {
+                    message.voice = value;
+                    ws.send(JSON.stringify(message));
+                } else if (key === 'sample_rate') {
+                    message.sample_rate = parseInt(value);
+                    ws.send(JSON.stringify(message));
+                } else if (key === 'system_prompt') {
+                    message.system_prompt = value;
+                    ws.send(JSON.stringify(message));
+                } else if (key === 'wake_word') {
+                    message.wake_word = value;
+                    ws.send(JSON.stringify(message));
+                } else if (key === 'tts_instruct') {
+                    message.tts_instruct = value;
+                    ws.send(JSON.stringify(message));
+                }
+            }
+        }
+
+        function applySettings() {
+            console.log('Applying settings:', settings);
+        }
+
+        function toggleSettings() {
+            const overlay = document.getElementById('settings-overlay');
+            if (overlay) {
+                overlay.style.display = overlay.style.display === 'flex' ? 'none' : 'flex';
+            }
+        }
+
+        // Export conversation
+        function exportConversation() {
+            const messages = conversationHistory.querySelectorAll('.message-row');
+            if (messages.length === 0) {
+                alert('No conversation to export.');
+                return;
+            }
+            let exportText = 'Jarvis Conversation Export\n';
+            exportText += '========================\n\n';
+            messages.forEach((msg, idx) => {
+                const isUser = msg.classList.contains('user');
+                const label = isUser ? 'User' : 'LLM';
+                const text = msg.querySelector('.message-text')?.textContent || '';
+                exportText += `${label}:\n${text}\n\n`;
+            });
+            const blob = new Blob([exportText], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `jarvis_conversation_${new Date().toISOString().slice(0, 10)}.txt`;
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        // Load settings when page loads
+        window.addEventListener('DOMContentLoaded', loadSettings);
 
         // WebSocket connections
         function connectVAD() {
@@ -536,7 +751,10 @@
                             }
                             currentTurnId = data.turn_id;
                         }
-                        const audioSeq = data.audio_seq !== undefined ? data.audio_seq : expectedNextSeq;
+                        let audioSeq = data.audio_seq !== undefined ? data.audio_seq : expectedNextSeq;
+                        if (turnSeqStart[currentTurnId] !== undefined) {
+                            audioSeq += turnSeqStart[currentTurnId];
+                        }
                         console.log('[AUDIO] About to enqueue:', { seq: audioSeq, expectedNextSeq, bufferLen: data.audio?.length });
                         enqueueAudioChunk(data.audio, audioSeq);
                         console.log('[AUDIO] After enqueue:', { expectedNextSeq, audioQueue: audioQueue.length, pendingAudioBuffers: pendingAudioBuffers.length });
@@ -559,6 +777,7 @@
                           console.log('[WS] llm_start: received', { turn_id: data.turn_id, activeLlmMessageId, llmMessageCount, allLlmMsgs: Array.from(conversationHistory.querySelectorAll('.message-row.llm')).map(el => el.id) });
                           currentTurnId = data.turn_id || 0;
                           previousTurnId = 0;
+                          turnSeqStart[currentTurnId] = expectedNextSeq;
                           clearPendingAudioBuffers();
                           // Only remove the currently streaming message (activeLlmMessageId != null means still generating)
                           // If activeLlmMessageId is null, the previous turn's message is already finalized and stays in DOM
@@ -595,6 +814,7 @@
                         console.log('[AUDIO] llm_end: currentTurnId=', currentTurnId, 'previousTurnId=', previousTurnId, 'expectedNextSeq=', expectedNextSeq, 'pending=', pendingAudioBuffers.length, 'queue=', audioQueue.length);
                         if (data.turn_id) {
                             previousTurnId = data.turn_id;
+                            turnSeqStart[data.turn_id] = expectedNextSeq;
                         }
                         const llmMsgEl = activeLlmMessageId ? document.getElementById(activeLlmMessageId) : null;
                         if (llmMsgEl) {
@@ -625,12 +845,17 @@
                         isLLMResponding = false;
                         currentTurnId = 0;
                         previousTurnId = 0;
+                        turnSeqStart = {};
                         break;
 
                     case 'audio_complete':
-                        console.log('[AUDIO] audio_complete received:', { turn_id: data.turn_id });
+                        console.log('[AUDIO] audio_complete received:', { turn_id: data.turn_id, lastAudioCompleteSeq });
                         if (data.turn_id) {
                             previousTurnId = data.turn_id;
+                        }
+                        if (data.turn_id) {
+                            lastAudioCompleteSeq = expectedNextSeq;
+                            turnSeqStart[data.turn_id] = lastAudioCompleteSeq;
                         }
                         break;
 

@@ -59,8 +59,9 @@ TTS_VOICE_INSTRUCT = os.getenv(
 )
 TTS_LANGUAGE = os.getenv("TTS_LANGUAGE", "Auto")
 TTS_SPEAKER = os.getenv("TTS_SPEAKER", "eric")
-TTS_CHUNK_WORDS = int(os.getenv("TTS_CHUNK_WORDS", "10"))  # Process every N words
-TTS_MAX_CHUNK_DURATION = float(os.getenv("TTS_MAX_CHUNK_DURATION", "3.0"))  # Max seconds before forcing chunk
+TTS_CHUNK_WORDS = int(os.getenv("TTS_CHUNK_WORDS", "30"))  # Process every N words (increased for fewer TTS passes)
+TTS_MAX_CHUNK_DURATION = float(os.getenv("TTS_MAX_CHUNK_DURATION", "4.0"))  # Max seconds before forcing chunk
+TTS_MIN_CHUNK_WORDS = int(os.getenv("TTS_MIN_CHUNK_WORDS", "8"))  # Minimum words before processing a chunk
 
 # Sentence boundary regex
 SENTENCE_RE = re.compile(r'[.!?]\s+|[.!?]$')
@@ -175,26 +176,28 @@ class QwenTTSProcessor:
             # Extract only the new words that haven't been processed yet
             words = text.split()
             new_text = " ".join(words[self.processed_words:])
-            self.current_chunk_text = new_text
+            self.current_chunk_text += (" " if self.current_chunk_text else "") + new_text
             self.processed_words = current_words
 
             # Check if we should process this chunk
             should_process = (
                 self._has_sentence_boundary(text) or
-                new_words >= TTS_CHUNK_WORDS
+                len(self.current_chunk_text.split()) >= TTS_CHUNK_WORDS or
+                len(self.current_chunk_text) >= 150
             )
 
             if should_process:
-                yield self._process_chunk(self.current_chunk_text)
+                chunk_to_process = self.current_chunk_text
                 self.current_chunk_text = ""
                 self.processed_words = current_words
+                yield self._process_chunk(chunk_to_process)
         else:
             # Final token - process remaining text
             current_words = len(text.split())
             new_words = current_words - self.processed_words
             if new_words > 0:
                 words = text.split()
-                self.current_chunk_text = " ".join(words[self.processed_words:])
+                self.current_chunk_text += (" " if self.current_chunk_text else "") + " ".join(words[self.processed_words:])
                 yield self._process_chunk(self.current_chunk_text)
             self.processed_words = 0
             self.current_chunk_text = ""
@@ -208,6 +211,7 @@ class QwenTTSProcessor:
         self.last_generated_len = 0
         self.interrupt_event.clear()
         self.current_turn_id = turn_id
+        # Note: keep last_generated_text/len to avoid regenerating prefixes of previous responses
 
     def interrupt(self):
         """Signal interruption (user started speaking again)."""
@@ -242,8 +246,9 @@ class QwenTTSProcessor:
                 language=self.language,
                 non_streaming_mode=True,
                 do_sample=True,
-                top_p=0.9,
-                temperature=0.7,
+                top_p=0.85,
+                temperature=0.6,
+                max_new_tokens=2048,
             )
             gen_time = _time.time() - gen_start
             logger.info(f"Model generation done in {gen_time:.1f}s, audio len={len(wavs[0])} samples")
@@ -302,8 +307,9 @@ class QwenTTSProcessor:
                         language=self.language,
                         non_streaming_mode=True,
                         do_sample=True,
-                        top_p=0.9,
-                        temperature=0.7,
+                        top_p=0.85,
+                        temperature=0.6,
+                        max_new_tokens=2048,
                     )
                     gen_time = _time.time() - gen_start
                     logger.info(f"Model regeneration done in {gen_time:.1f}s, audio len={len(wavs[0])} samples")
@@ -593,9 +599,13 @@ async def handle_tts(websocket, tts_processor):
                     logger.info("TTS generation stopped (interrupt)")
 
                 elif msg_type == "set_voice":
-                    voice = msg.get("voice", "male")
-                    tts_processor.voice_instruct = msg.get("instruct", TTS_VOICE_INSTRUCT)
-                    logger.info(f"TTS voice/instruct changed")
+                    speaker = msg.get("speaker", msg.get("voice"))
+                    instruct = msg.get("instruct")
+                    if speaker:
+                        tts_processor.speaker = speaker
+                    if instruct:
+                        tts_processor.voice_instruct = instruct
+                    logger.info(f"TTS voice/instruct changed: speaker={tts_processor.speaker}, instruct={tts_processor.voice_instruct[:50]}")
 
             except json.JSONDecodeError as e:
                 logger.error(f"Invalid JSON from server: {e}")

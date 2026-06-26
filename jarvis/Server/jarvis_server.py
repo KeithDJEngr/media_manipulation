@@ -335,6 +335,63 @@ async def handle_client_message(data, websocket):
         await manager.broadcast_to_client({"type": "reset_complete"})
         logger.info("Conversation reset by user")
 
+    elif msg_type == "set_settings":
+        voice = data.get("voice")
+        sample_rate = data.get("sample_rate")
+        system_prompt = data.get("system_prompt")
+        wake_word = data.get("wake_word")
+        tts_instruct = data.get("tts_instruct")
+
+        if voice:
+            if manager.tts_ws and manager.tts_ws.state.name == "OPEN":
+                await manager.tts_ws.send(json.dumps({
+                    "type": "set_voice",
+                    "speaker": voice,
+                }))
+            logger.info(f"Updated TTS voice to: {voice}")
+
+        if tts_instruct:
+            if manager.tts_ws and manager.tts_ws.state.name == "OPEN":
+                await manager.tts_ws.send(json.dumps({
+                    "type": "set_voice",
+                    "instruct": tts_instruct,
+                }))
+            logger.info(f"Updated TTS instruct to: {tts_instruct}")
+
+        if system_prompt:
+            if manager.llm_service_ws and manager.llm_service_ws.state.name == "OPEN":
+                await manager.llm_service_ws.send(json.dumps({
+                    "type": "set_system_prompt",
+                    "prompt": system_prompt,
+                }))
+            elif manager.llm_ws and manager.llm_ws.state.name == "OPEN":
+                await manager.llm_ws.send(json.dumps({
+                    "type": "set_system_prompt",
+                    "prompt": system_prompt,
+                }))
+            logger.info(f"Updated LLM system prompt")
+
+        if wake_word is not None:
+            logger.info(f"Wake word detection: {'enabled' if wake_word else 'disabled'}")
+
+        logger.info("Settings updated")
+
+    elif msg_type == "set_voice":
+        if manager.tts_ws and manager.tts_ws.state.name == "OPEN":
+            await manager.tts_ws.send(json.dumps({"type": "set_voice", "voice": data.get("voice", "eric")}))
+        logger.info(f"Voice changed to: {data.get('voice', 'eric')}")
+
+    elif msg_type == "set_sample_rate":
+        logger.info(f"Sample rate set to: {data.get('sample_rate', 16000)}")
+
+    elif msg_type == "set_system_prompt":
+        if manager.llm_ws and manager.llm_ws.state.name == "OPEN":
+            await manager.llm_ws.send(json.dumps({"type": "set_system_prompt", "prompt": data.get("prompt", "")}))
+        logger.info("System prompt updated")
+
+    elif msg_type == "set_wake_word":
+        logger.info(f"Wake word: {data.get('enabled', False)}")
+
 async def handle_vad(websocket):
     """Handle browser connection to /vad endpoint.
     
@@ -494,11 +551,17 @@ async def handle_stt(websocket):
                         "chunk_id": data.get("chunk_id")
                     })
                     # Update the latest user message in conversation_history so the LLM sees partials
+                    # If no user message exists yet (first turn), create one
+                    found_user = False
                     for i in range(len(manager.conversation_history) - 1, -1, -1):
                         if manager.conversation_history[i]["role"] == "user":
                             manager.conversation_history[i]["content"] = partial_text
+                            found_user = True
                             logger.info("Updated partial transcript in conversation_history: '%s'", partial_text)
                             break
+                    if not found_user:
+                        manager.conversation_history.append({"role": "user", "content": partial_text})
+                        logger.info("Created new user entry in conversation_history for partial: '%s'", partial_text)
                     # Also forward partial to LLM service if it's actively generating
                     ws_to_send = manager.llm_service_ws if manager.llm_service_ws else manager.llm_ws
                     if ws_to_send and ws_to_send.state.name == "OPEN":
@@ -520,16 +583,17 @@ async def handle_stt(websocket):
                         "final": True,
                         "chunk_id": data.get("chunk_id")
                     })
-                    # Replace the last user message (updated by partial) with the final text
-                    # or append a new one if no partial was set yet
-                    user_appended = False
-                    #for i in range(len(manager.conversation_history) - 1, -1, -1):
-                    #    if manager.conversation_history[i]["role"] == "user":
-                    #        manager.conversation_history[i]["content"] += "\n"+user_text
-                    #        user_appended = True
-                    #        break
-                    if not user_appended:
+                    # Update or create user message in conversation_history
+                    found_user = False
+                    for i in range(len(manager.conversation_history) - 1, -1, -1):
+                        if manager.conversation_history[i]["role"] == "user":
+                            manager.conversation_history[i]["content"] = user_text
+                            found_user = True
+                            logger.info("Updated final transcript in conversation_history: '%s'", user_text)
+                            break
+                    if not found_user:
                         manager.conversation_history.append({"role": "user", "content": user_text})
+                        logger.info("Created new user entry in conversation_history for final transcript: '%s'", user_text)
                     logger.info(f"STT conversation_history before forwarding to LLM: {json.dumps(manager.conversation_history, ensure_ascii=False)}")
                     # Forward directly to LLM service (not through browser /llm endpoint)
                     ws_to_send = manager.llm_service_ws if manager.llm_service_ws else manager.llm_ws

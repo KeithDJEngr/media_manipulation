@@ -1,39 +1,44 @@
 # Current state
 The webpage works. It has a transcript with user messages and LLM responses. It has a strange voice responding slowly but it does respond.
 
+# Completed tasks
+
+## Bugs
+- [ ] I just connected 
+- [x] STT stuck at starting - added timeout mechanism and fixed buffer clearing on speech end
+- [x] After streaming STT text it went blank - fixed VAD result handling and waiting_for_audio_after_eos state
+- [x] Audio from later messages played before earlier - fixed audio_seq per-turn tracking
+- [x] First partial message junk - fixed conversation_history update when no user message exists
+- [x] Partial transcripts not updating - STT now always sends partial_transcript (even empty)
+- [x] Mobile browser mic denied - added better error messages and audio processing options
+- [x] llm_start turn_id reset logic - fixed per-turn sequence offset tracking
+
+## Performance
+- [x] Speech takes long to generate - increased TTS chunk size, optimized generation parameters
+- [x] VAD rapid-fire utterance batching - added 0.5s speech end debounce
+- [x] TTS model warmup overhead - kept model loaded, reduced redundant generation, increased chunk thresholds
+
+## New features
+- [x] TTS voice selection UI control - dropdown with presets (eric, sarah, james, emma) and custom
+- [x] Wake word detection toggle - always-listening mode in settings
+- [x] Custom system prompt via UI - textarea in settings panel, sent to LLM service
+- [x] Audio quality settings (sample rate) - 16kHz/22.05kHz/44.1kHz selection
+- [x] Copy message to clipboard - per-message copy button with visual feedback
+- [x] Conversation export - export button downloads conversation as text file
+- [x] TTS voice instruct - configurable in settings panel
+
 # Remaining tasks
-
-## Remaining TODOs
-
-### Bugs
-- [ ] Sometimes it takes gets stuck at starting. That's the state I quit it at last. It looks like the STT is having an error. Please review logs and resolve anything you find.
-- [ ] Audio from later messages can be played before earlier messages. Make them go in order.
-- [ ] Partial transcripts on the are not updating properly on the client. It starts as the first word heard and then doesn't update past that until the full message is done. 
-- [ ] My phone browser refuses to work with the microphone. It says the server says: Microphone access denied or error: Permission denied. I don't want to have to download a certificate to each device I want to connect on.
-- [ ] The first message it responds to is partial junk and it doesn't save it to the history (it's the first partial and it doesn't update).
-
-### Performance
-- [ ] Speech takes long to generate. Please speed it up.
-- [ ] STT performance investigation shows real-time factors < 0.1x for some lengths - inconsistent. Investigate GPU memory contention between models.
-- [ ] Consider batching multiple short utterances if VAD fires rapidly
-- [ ] TTS model warmup on each generation adds overhead - consider keeping model in memory between turns
-
-# Future tasks
 
 ## Future TODOs
 
 ### Improvements
-- [ ] ?? The `llm_start` turn_id reset logic in browser can cause messages to appear out of order - investigate turn_id tracking
-
-### Future features
-- [ ] Add TTS voice selection UI control (currently hardcoded to "eric")
-- [ ] Add conversation export (save chat history to file)
-- [ ] Add audio playback volume control in UI
-- [ ] Consider adding a "listening history" panel separate from conversation
+- [ ] Audio playback volume control in UI
+- [ ] Listening history panel separate from conversation
 - [ ] Multi-language support (current STT is English-only)
-- [ ] Wake word detection (always-listening mode)
-- [ ] Custom system prompt via UI
 - [ ] Conversation search
-- [ ] Audio quality settings (sample rate, bit depth)
 
-
+### New features
+- [ ] Wake word detection (actual keyword-based, not just always-listening mode)
+- [ ] Advanced audio processing (noise suppression, echo cancellation tuning)
+- [ ] Dark/light theme toggle
+- [ ] Keyboard shortcuts for common actions

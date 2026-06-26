@@ -186,6 +186,8 @@ async def handle_stt(websocket, stt_service):
     heartbeat_task = asyncio.create_task(send_heartbeats())
     
     waiting_for_audio_after_eos = False
+    last_chunk_time = asyncio.get_event_loop().time()
+    STT_CHUNK_TIMEOUT = 3.0
 
     try:
         # Wait for client message
@@ -213,28 +215,47 @@ async def handle_stt(websocket, stt_service):
                 msg_type = msg.get("type")
                 logger.info(f'msg.get("type"): {msg.get("type")}, msg.get("speech"): {msg.get("speech")}')
 
+                # Check for timeout while waiting for audio after speech end
+                if waiting_for_audio_after_eos:
+                    elapsed = asyncio.get_event_loop().time() - last_chunk_time
+                    if elapsed >= STT_CHUNK_TIMEOUT and len(stt_service.audio_buffer) > 0:
+                        logger.info(f"STT timeout waiting for audio: {elapsed:.1f}s, buffer: {len(stt_service.audio_buffer)} samples")
+                        waiting_for_audio_after_eos = False
+                        text = stt_service.transcribe()
+                        if text:
+                            await websocket.send(json.dumps({
+                                "type": "final_transcript",
+                                "text": text,
+                                "final": True,
+                                "chunk_id": 0,
+                            }))
+                            logger.info(f"STT sent final_transcript (timeout flush)")
+                        stt_service.clear_buffer()
+                        continue
+
                 if msg_type == "audio_chunk":
                     audio_b64 = msg.get("audio")
                     if not audio_b64:
                         continue
                     audio_bytes = base64.b64decode(audio_b64)
                     stt_service.add_audio_chunk(audio_bytes)
+                    last_chunk_time = asyncio.get_event_loop().time()
                     stt_service.samples_since_last_partial += len(audio_bytes) // 2
                     logger.info(f"Added audio chunk, buffer size: {len(stt_service.audio_buffer)}, samples since last partial: {stt_service.samples_since_last_partial}")
                     if stt_service.samples_since_last_partial >= 1024:
                         logger.info("Triggering transcribe_partial on buffer size: %d", len(stt_service.audio_buffer))
                         partial_text = stt_service.transcribe_partial()
                         logger.info("transcribe_partial returned: '%s'", partial_text)
-                        if partial_text:
-                            await websocket.send(json.dumps({
-                                "type": "partial_transcript",
-                                "text": partial_text,
-                                "chunk_id": msg.get("chunk_id", 0),
-                            }))
-                            logger.info(f"Sent partial_transcript: {partial_text}")
-                            if waiting_for_audio_after_eos:
-                                waiting_for_audio_after_eos = False
-                                chunk_id = msg.get("chunk_id", 0)
+                        chunk_id = msg.get("chunk_id", 0)
+                        await websocket.send(json.dumps({
+                            "type": "partial_transcript",
+                            "text": partial_text,
+                            "chunk_id": chunk_id,
+                        }))
+                        logger.info(f"Sent partial_transcript: '{partial_text}'")
+                        if waiting_for_audio_after_eos:
+                            waiting_for_audio_after_eos = False
+                            if partial_text:
                                 await websocket.send(json.dumps({
                                     "type": "final_transcript",
                                     "text": partial_text,
@@ -242,7 +263,22 @@ async def handle_stt(websocket, stt_service):
                                     "chunk_id": chunk_id,
                                 }))
                                 logger.info(f"STT sent final_transcript to server (deferred from end_of_speech)")
-                        stt_service.samples_since_last_partial = 0
+                                stt_service.clear_buffer()
+                            else:
+                                # Buffer has data but partial returned empty - check if buffer is getting too large
+                                if len(stt_service.audio_buffer) >= 5120:
+                                    logger.info(f"Buffer too large ({len(stt_service.audio_buffer)} samples) while waiting, sending empty final")
+                                    await websocket.send(json.dumps({
+                                        "type": "final_transcript",
+                                        "text": "",
+                                        "final": True,
+                                        "chunk_id": chunk_id,
+                                    }))
+                                    stt_service.clear_buffer()
+                                else:
+                                    stt_service.samples_since_last_partial = 0
+                        else:
+                            stt_service.samples_since_last_partial = 0
 
                 elif msg_type == "vad_result" and msg.get("speech") == False:
                     logger.info(f"End of speech, buffer size: {len(stt_service.audio_buffer)}")
@@ -250,7 +286,7 @@ async def handle_stt(websocket, stt_service):
                         waiting_for_audio_after_eos = True
                         logger.info("End of speech with empty buffer, waiting for audio chunk")
                     else:
-                        waiting_for_audio_after_eos = False
+                        waiting_for_audio_after_eos = True
                         # Transcribe accumulated audio
                         text = stt_service.transcribe()
                         if text:

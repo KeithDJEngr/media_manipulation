@@ -76,7 +76,7 @@ class VADProcessor:
     WINDOW_SIZE = 512
     SAMPLE_RATE = 16000
 
-    def __init__(self, model, threshold=0.5, silence_threshold_samples=1600, silence_threshold_samples_grace=4000):
+    def __init__(self, model, threshold=0.5, silence_threshold_samples=1600, silence_threshold_samples_grace=4000, speech_end_debounce_samples=8000):
         """
         Args:
             model: Silero VAD ONNX model
@@ -85,11 +85,14 @@ class VADProcessor:
                                        (1600 samples = 100ms at 16kHz)
             silence_threshold_samples_grace: Silent samples at start before silence counting begins
                                              (~250ms grace period for VAD state warmup)
+            speech_end_debounce_samples: Additional silence samples to wait before confirming speech end
+                                        (8000 samples = 0.5s debounce to batch rapid utterances)
         """
         self.model = model
         self.threshold = threshold
         self.silence_threshold_samples = silence_threshold_samples
         self.silence_threshold_samples_grace = silence_threshold_samples_grace
+        self.speech_end_debounce_samples = speech_end_debounce_samples
 
         logger.info(f"Starting the vad with: ")
         logger.info(f"  WINDOW_SIZE: {self.WINDOW_SIZE}")
@@ -97,7 +100,8 @@ class VADProcessor:
         logger.info(f"  THRESHOLD: {self.threshold}")
         logger.info(f"  SILENCE_THRESHOLD: {self.silence_threshold_samples}")
         logger.info(f"  SILENCE_GRACE: {self.silence_threshold_samples_grace}")
-        logger.info(f"  Resulting silence gap for speach end: {self.silence_threshold_samples/self.SAMPLE_RATE} sec")
+        logger.info(f"  DEBOUNCE: {self.speech_end_debounce_samples}")
+        logger.info(f"  Resulting silence gap for speech end: {self.silence_threshold_samples/self.SAMPLE_RATE} sec")
 
 
         # State tracking
@@ -109,6 +113,10 @@ class VADProcessor:
         # Audio buffer for speech segments (accumulates audio during speaking)
         self.speech_buffer = []
         self.speech_sample_count = 0
+
+        # Debounce state for speech end batching
+        self.debounce_silence_count = 0
+        self.pending_speech_end = False
 
         # Internal processing state
         self._prev_prob = None
@@ -182,33 +190,78 @@ class VADProcessor:
 
                 # Check if silence duration exceeds threshold
                 if self.silence_sample_count >= self.silence_threshold_samples:
-                    # Send accumulated speech buffer as one message
-                    if self.speech_buffer:
-                        full_audio = np.concatenate(self.speech_buffer)
-                        messages.append(
-                            {
-                                "type": "audio_chunk",
-                                "audio": base64.b64encode(
-                                    self.float32_to_int16_bytes(full_audio)
-                                ).decode("ascii"),
-                                "chunk_id": self.chunk_id,
-                            }
-                        )
-                        self.speech_buffer = []
-                        self.speech_sample_count = 0
+                    # Check if we already have a pending speech end (debounce)
+                    if self.pending_speech_end:
+                        # Still in debounce - check if silence exceeds debounce threshold
+                        if self.debounce_silence_count >= self.speech_end_debounce_samples:
+                            # Debounce complete - confirm speech end
+                            if self.speech_buffer:
+                                full_audio = np.concatenate(self.speech_buffer)
+                                messages.append(
+                                    {
+                                        "type": "audio_chunk",
+                                        "audio": base64.b64encode(
+                                            self.float32_to_int16_bytes(full_audio)
+                                        ).decode("ascii"),
+                                        "chunk_id": self.chunk_id,
+                                    }
+                                )
+                                self.speech_buffer = []
+                                self.speech_sample_count = 0
 
-                    self.is_speaking = False
-                    self.speech_ended = True
-                    logger.info("Detected end of speech")
-                    messages.append(
-                        {
-                            "type": "vad_result",
-                            "speech": False,
-                            "chunk_id": self.chunk_id,
-                        }
-                    )
+                            self.is_speaking = False
+                            self.speech_ended = True
+                            self.pending_speech_end = False
+                            self.debounce_silence_count = 0
+                            logger.info("Detected end of speech (after debounce)")
+                            messages.append(
+                                {
+                                    "type": "vad_result",
+                                    "speech": False,
+                                    "chunk_id": self.chunk_id,
+                                }
+                            )
+                        else:
+                            # Still in debounce - accumulate silence count
+                            self.debounce_silence_count += self.WINDOW_SIZE
+                            # Send window individually during debounce
+                            messages.append(
+                                {
+                                    "type": "audio_chunk",
+                                    "audio": base64.b64encode(
+                                        self.float32_to_int16_bytes(window)
+                                    ).decode("ascii"),
+                                    "chunk_id": self.chunk_id,
+                                }
+                            )
+                    else:
+                        # First silence threshold hit - start debounce
+                        self.pending_speech_end = True
+                        self.debounce_silence_count = 0
+                        # Send accumulated speech buffer so far
+                        if self.speech_buffer:
+                            full_audio = np.concatenate(self.speech_buffer)
+                            messages.append(
+                                {
+                                    "type": "audio_chunk",
+                                    "audio": base64.b64encode(
+                                        self.float32_to_int16_bytes(full_audio)
+                                    ).decode("ascii"),
+                                    "chunk_id": self.chunk_id,
+                                }
+                            )
+                            self.speech_buffer = []
+                            self.speech_sample_count = 0
+                        # Don't send speech_end yet - waiting for debounce
+                        logger.info("Silence threshold hit, starting debounce")
 
                 else:
+                    # Reset debounce if speech resumes during debounce period
+                    if self.pending_speech_end:
+                        self.pending_speech_end = False
+                        self.debounce_silence_count = 0
+                        logger.info("Speech resumed during debounce")
+
                     # Still accumulating speech - send window individually
                     messages.append(
                         {
@@ -336,7 +389,10 @@ async def main():
     model = await load_vad_model()
 
     # Create VAD processor with tuned parameters
-    vad_processor = VADProcessor(model, threshold=0.6, silence_threshold_samples=9000, silence_threshold_samples_grace=4000)
+    vad_processor = VADProcessor(
+        model, threshold=0.6, silence_threshold_samples=9000,
+        silence_threshold_samples_grace=4000, speech_end_debounce_samples=8000
+    )
 
     # Prime the VAD model's hidden states so the first audio predictions are reliable
     VADProcessor.warmup(model)
