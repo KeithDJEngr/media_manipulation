@@ -14,7 +14,7 @@ The webpage works. It has a transcript with user messages and LLM responses.
 - [ ] Conversation history is not working. It just has the system and latest messages. Doesn't look like the LLM logs are showing it modified message history so it may be default false and working except UI or it may not be working.
 
 ## Performance
-- [ ] Are there any broad changes to make the system more efficient?
+- [ ] Are there any broad changes to make the system more efficient? Do another performance review like in PERFORMANCE.md and generate PERFORMANCE2.md.
 - [ ] What could be done to speed up the TTS or STT, especially STT? Are there other models, ways of retaining loading params, or anything that would still provide good quality but be faster?
 
 ## New features

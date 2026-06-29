@@ -318,7 +318,6 @@
 
     /* Settings overlay */
     .settings-overlay {
-        display: none;
         position: fixed;
         top: 0;
         left: 0;
@@ -328,6 +327,7 @@
         z-index: 1000;
         justify-content: center;
         align-items: center;
+        display: none;
     }
 
     .settings-overlay.active {

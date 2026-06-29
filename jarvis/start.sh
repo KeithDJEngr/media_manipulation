@@ -9,6 +9,7 @@
 #   HOST: Server bind address (default: 0.0.0.0)
 #   STT_DEVICE: Device for STT model ('cpu' or 'cuda', auto-detects if not set)
 #   TTS_DEVICE: Device for TTS model ('cpu' for Intel GPU/CPU, 'cuda:0' for NVIDIA GPU)
+#   TTS_MODEL_TIER: TTS model size ('0.6B-Base' fastest, '0.6B-CustomVoice' balanced, '1.7B' best quality, default: 1.7B)
 #   STT_MODEL: Parakeet model name (default: nvidia/parakeet-tdt-0.6b-v3)
 #   LLM_API_URL: External LLM API URL (default: http://192.168.0.121:8000/chat/completions)
 #   LLM_MODEL: LLM model name for API calls (default: dummy)
@@ -36,7 +37,21 @@ echo ""
 # Dependencies required
 if ! command -v mkcert &> /dev/null; then
     echo "Installing mkcert..."
-    sudo pacman -S mkcert
+    if command -v apt-get &> /dev/null; then
+        sudo apt-get install -y mkcert
+    elif command -v dnf &> /dev/null; then
+        sudo dnf install -y mkcert
+    elif command -v yum &> /dev/null; then
+        sudo yum install -y mkcert
+    elif command -v brew &> /dev/null; then
+        brew install mkcert
+    elif command -v pacman &> /dev/null; then
+        sudo pacman -S --noconfirm mkcert
+    else
+        echo "WARNING: Could not install mkcert automatically."
+        echo "Please install mkcert manually: https://github.com/FiloSottile/mkcert"
+        echo "Continuing without SSL certificates..."
+    fi
 else
     echo "mkcert already installed"
 fi
@@ -139,7 +154,7 @@ sleep 2
 
 # Start TTS service
 echo "Starting TTS service..."
-SERVER_HOST=${HOST} SERVER_PORT=${PORT} TTS_DEVICE=${TTS_DEVICE:-xpu} nohup .venv/bin/python TTS/tts_service.py > /tmp/jarvis_tts.log 2>&1 &
+SERVER_HOST=${HOST} SERVER_PORT=${PORT} TTS_DEVICE=${TTS_DEVICE:-xpu} TTS_MODEL_TIER=${TTS_MODEL_TIER:-1.7B} nohup .venv/bin/python TTS/tts_service.py > /tmp/jarvis_tts.log 2>&1 &
 TTS_PID=$!
 disown $TTS_PID
 

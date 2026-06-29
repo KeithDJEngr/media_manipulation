@@ -94,6 +94,14 @@
                         <h3>TTS Voice Instruct</h3>
                         <input type="text" id="tts-instruct" placeholder="e.g., Speak in a calm, natural tone" oninput="updateSetting('tts_instruct', this.value)">
                     </div>
+                    <div class="settings-group">
+                        <h3>Playback Volume</h3>
+                        <div style="display: flex; align-items: center; gap: 12px;">
+                            <span style="font-size: 16px;">🔊</span>
+                            <input type="range" id="volume-slider" min="0" max="100" value="100" oninput="updateSetting('volume', this.value)" style="flex: 1;">
+                            <span id="volume-value" style="font-size: 12px; color: #888; min-width: 36px; text-align: right;">100%</span>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -134,7 +142,6 @@
 
         const startBtn = document.getElementById('start-btn');
         const conversationHistory = document.getElementById('conversation-history');
-        const llmHistory = document.getElementById('llm-history');
         const userStatus = document.getElementById('user-status');
         const llmStatus = document.getElementById('llm-status');
 
@@ -296,7 +303,6 @@
 
         function clearHistory() {
             conversationHistory.innerHTML = '';
-            if (llmHistory) llmHistory.innerHTML = '';
             activeLlmMessageId = null;
             lastUserMessageId = null;
         }
@@ -452,6 +458,7 @@
         async function initPlaybackContext() {
             if (!audioContextForPlayback) {
                 audioContextForPlayback = new (window.AudioContext || window.webkitAudioContext)();
+                audioContextForPlayback.volume = playbackVolume;
                 console.log('[AUDIO] Created AudioContext, state:', audioContextForPlayback.state);
             }
             if (audioContextForPlayback.state === 'suspended') {
@@ -610,9 +617,11 @@
             wake_word: false,
             tts_instruct: 'Speak in a calm, natural conversational tone.',
             use_full_history: true,
+            volume: 100,
         };
 
         let settings = { ...defaultSettings };
+        let playbackVolume = 1.0;
 
         function loadSettings() {
             const saved = localStorage.getItem('jarvis_settings');
@@ -672,6 +681,15 @@
             if (ttsInstructInput) {
                 ttsInstructInput.value = settings.tts_instruct;
             }
+
+            const volumeSlider = document.getElementById('volume-slider');
+            const volumeValue = document.getElementById('volume-value');
+            if (volumeSlider) {
+                volumeSlider.value = settings.volume ?? 100;
+            }
+            if (volumeValue) {
+                volumeValue.textContent = (settings.volume ?? 100) + '%';
+            }
         }
 
         function updateSetting(key, value) {
@@ -699,18 +717,29 @@
                 } else if (key === 'use_full_history') {
                     message.use_full_history = value;
                     ws.send(JSON.stringify(message));
+                } else if (key === 'volume') {
+                    playbackVolume = parseInt(value) / 100;
+                    const volDisplay = document.getElementById('volume-value');
+                    if (volDisplay) volDisplay.textContent = value + '%';
+                    if (audioContextForPlayback) {
+                        audioContextForPlayback.volume = playbackVolume;
+                    }
                 }
             }
         }
 
         function applySettings() {
             console.log('Applying settings:', settings);
+            playbackVolume = (settings.volume ?? 100) / 100;
+            if (audioContextForPlayback) {
+                audioContextForPlayback.volume = playbackVolume;
+            }
         }
 
         function toggleSettings() {
             const overlay = document.getElementById('settings-overlay');
             if (overlay) {
-                overlay.style.display = overlay.style.display === 'flex' ? 'none' : 'flex';
+                overlay.classList.toggle('active');
             }
         }
 

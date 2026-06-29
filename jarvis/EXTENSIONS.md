@@ -254,6 +254,9 @@ class WhisperSTT:
 | [PlayHT](https://play.ht/) | API key | Great | Medium | Cloud |
 | [gTTS](https://github.com/pndajies/gTTS) | `pip install gTTS` | Okay | Slow | Google Translate TTS |
 | [MaryTTS](http://mary.dfki.de/) | Docker | Okay | Medium | Self-hosted |
+| **Qwen3-TTS 0.6B-Base** | `TTS_MODEL_TIER=0.6B-Base` | Good | Fastest | 3-8s generation, offline |
+| **Qwen3-TTS 0.6B-CustomVoice** | `TTS_MODEL_TIER=0.6B-CustomVoice` | Excellent | Fast | 5-15s generation, offline |
+| **Qwen3-TTS 1.7B-CustomVoice** | default | Best | Slower | 10-30s generation, offline |
 
 **Piper TTS example** (minimal TTS service):
 ```python

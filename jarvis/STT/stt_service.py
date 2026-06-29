@@ -277,6 +277,7 @@ async def handle_stt(websocket, stt_service):
                                 "chunk_id": chunk_id,
                             }))
                             logger.info(f"Sent partial_transcript: '{partial_text}'")
+                            stt_service.samples_since_last_partial = 0
                             if waiting_for_audio_after_eos:
                                 waiting_for_audio_after_eos = False
                                 if partial_text:
@@ -339,11 +340,23 @@ async def handle_stt(websocket, stt_service):
                                     "chunk_id": chunk_id,
                                 }))
                                 logger.info(f"STT sent final_transcript to server")
-                        # Clear partial text on end of speech
-                        stt_service.clear_buffer()
+                        elif not stt_service.is_muted:
+                            # Send empty final transcript even with small/no buffer so LLM gets signal
+                            logger.info(f"STT sent empty final_transcript on end_of_speech (buffer: {len(stt_service.audio_buffer)} samples)")
+                            await websocket.send(json.dumps({
+                                "type": "final_transcript",
+                                "text": "",
+                                "final": True,
+                                "chunk_id": chunk_id,
+                            }))
+                            stt_service.clear_buffer()
+                        else:
+                            stt_service.clear_buffer()
 
                 elif msg_type == "partial":
                     # Partial transcription request (for streaming)
+                    waiting_for_audio_after_eos = False
+                    last_chunk_time = asyncio.get_event_loop().time()
                     text = stt_service.transcribe_partial()
                     if not stt_service.is_muted:
                         if text:

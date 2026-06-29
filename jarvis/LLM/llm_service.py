@@ -107,7 +107,7 @@ async def handle_llm(websocket, llm_info):
 
                 if msg_type == "user_input":
                     user_text = msg.get("text", "")
-                    print(f"user_text: {user_text}")
+                    logger.info(f"LLM-SERVICE <<< user_input text='{user_text[:80]}...'")
                     if not user_text.strip():
                         continue
                         
@@ -116,12 +116,12 @@ async def handle_llm(websocket, llm_info):
                     # Accept history from server if provided
                     if "history" in msg:
                         new_history = msg["history"]
+                        logger.info(f"LLM-SERVICE - got new history from server: {new_history[1:]}")
                         # Keep system prompt, replace rest
                         if len(new_history) > 0 and new_history[0].get("role") == "system":
-                            conversation_history = new_history.copy()
+                            conversation_history[:] = [{"role": "system", "content": SYSTEM_PROMPT}] + new_history[1:]
                         else:
-                            conversation_history = [{"role": "system", "content": SYSTEM_PROMPT}]
-                            conversation_history.extend(new_history)
+                            conversation_history[:] = [{"role": "system", "content": SYSTEM_PROMPT}] + new_history
                     
                     logger.info(f"LLM-SERVICE <<< user_input (partial={is_partial}, text='{user_text[:80]}...')")
                     
@@ -178,6 +178,7 @@ async def handle_llm(websocket, llm_info):
                         "max_tokens": llm_info.get('max_tokens', LLM_MAX_TOKENS),
                     }
 
+                    generation_ok = False
                     try:
                         logger.info(f"Connecting to {llm_info['api_url']}...")
                         llm_msg=""
@@ -191,7 +192,8 @@ async def handle_llm(websocket, llm_info):
                             async with client.stream("POST", llm_info['api_url'], json=payload) as response:
                                 if response.status_code != 200:
                                     logger.info(f"Error: {response.status_code}")
-                                    return
+                                    generation_ok = True
+                                    break
 
                                 logger.info("Receiving Stream:\n")
 
@@ -221,11 +223,17 @@ async def handle_llm(websocket, llm_info):
                                                 token_count += 1
                                                 if token_count <= 3 or token_count % 20 == 0:
                                                     logger.info(f"LLM-SERVICE: token #{token_count}: '{token}' (accumulated so far: '{llm_msg[:80]}...')")
-                                                await websocket.send(json.dumps({"type": "llm_token", "text": token, "partial": True}))
+                                                try:
+                                                    await websocket.send(json.dumps({"type": "llm_token", "text": token, "partial": True}))
+                                                except websockets.ConnectionClosed:
+                                                    logger.info("WebSocket closed during token streaming")
+                                                    generation_ok = True
+                                                    break
 
                                     except json.JSONDecodeError:
                                         continue
 
+                                generation_ok = True
                                 logger.info(f"\n\nDone. Total tokens streamed: {token_count}")
 
                     except httpx.ConnectError:
@@ -235,38 +243,22 @@ async def handle_llm(websocket, llm_info):
 
 
 
-
                     # Add to conversation history (user message already in history from server)
                     conversation_history.append({"role": "assistant", "content": llm_msg})
 
                     # Trim history to keep last 20 messages (system prompt + 19 turns) to manage context window
                     if len(conversation_history) > 21:
-                        conversation_history = conversation_history[:2] + conversation_history[-19:]
+                        conversation_history = conversation_history[-19:]
 
                     # Send end signal with accumulated text
                     logger.info(f"LLM-SERVICE: sending llm_end (total_text_len={len(llm_msg)}, text='{llm_msg[:100]}...')")
-                    await websocket.send(json.dumps({
-                        "type": "llm_end",
-                        "text": llm_msg,
-                    }))
-
-                    # Log generation status
-                    if llm_msg:
-                        logger.info(f"LLM generation complete: {llm_msg[:100]}...")
-                    else:
-                        logger.info("LLM generation complete (empty response)")
-
-                elif msg_type == "reset":
-                    # Reset conversation history
-                    llm_service.history.clear()
-                    llm_service.history.append({"role": "system", "content": SYSTEM_PROMPT})
-                    logger.info("LLM conversation reset")
-                
-                elif msg_type == "set_system_prompt":
-                    new_prompt = msg.get("prompt", "")
-                    if new_prompt:
-                        llm_service.history[0] = {"role": "system", "content": new_prompt}
-                        logger.info("System prompt updated")
+                    try:
+                        await websocket.send(json.dumps({
+                            "type": "llm_end",
+                            "text": llm_msg,
+                        }))
+                    except websockets.ConnectionClosed:
+                        logger.info("WebSocket closed before sending llm_end")
 
             except json.JSONDecodeError as e:
                 logger.error(f"Invalid JSON from server: {e}")

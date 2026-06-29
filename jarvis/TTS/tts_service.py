@@ -47,10 +47,17 @@ logger = logging.getLogger(__name__)
 
 # TTS configuration
 SAMPLE_RATE = 16000
-TTS_MODEL = os.getenv(
-    "TTS_MODEL",
-    "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
-)
+# Available TTS models (fastest → best quality):
+#   Qwen3-TTS-12Hz-0.6B-Base    - Fastest, ~3-8s generation, good quality
+#   Qwen3-TTS-12Hz-0.6B-CustomVoice - Fast, ~5-15s generation, excellent quality
+#   Qwen3-TTS-12Hz-1.7B-CustomVoice - Slower, ~10-30s generation, best quality
+TTS_MODEL_TIER = os.getenv("TTS_MODEL_TIER", "1.7B")
+TTS_MODEL_MAP = {
+    "0.6B-Base": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+    "0.6B-CustomVoice": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+    "1.7B": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+}
+TTS_MODEL = os.getenv("TTS_MODEL", TTS_MODEL_MAP.get(TTS_MODEL_TIER, TTS_MODEL_MAP["1.7B"]))
 TTS_DEVICE = os.getenv("TTS_DEVICE", "xpu")
 TTS_DTYPE = os.getenv("TTS_DTYPE", "float32")
 TTS_VOICE_INSTRUCT = os.getenv(
@@ -65,10 +72,6 @@ TTS_MIN_CHUNK_WORDS = int(os.getenv("TTS_MIN_CHUNK_WORDS", "8"))  # Minimum word
 
 # Sentence boundary regex
 SENTENCE_RE = re.compile(r'[.!?]\s+|[.!?]$')
-
-
-# Global vars
-global global_audio_seq
 
 
 class QwenTTSProcessor:
