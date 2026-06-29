@@ -6,12 +6,15 @@ The webpage works. It has a transcript with user messages and LLM responses.
 
 # Remaining tasks
 
+## General
+- [ ] Conversation history is not working.
+- [ ] LLM response on new msgs is just the same as the first response. Fix the conversation history and counting and see if it's fixed.
+
 ## Review
 - [ ] Review the repo. Generate a summary of all the elements involved, how they work together, and all the functionality included in detail.
 
 ## Bugs - spin up additional agents to handle these one at a time
 - [ ] Not sure if settings are changing anything or not. Review the logs and see if you can spot anything missing with getting the settings to .
-- [ ] Conversation history is not working. It just has the system and latest messages. Doesn't look like the LLM logs are showing it modified message history so it may be default false and working except UI or it may not be working.
 
 ## Performance
 - [ ] Are there any broad changes to make the system more efficient? Do another performance review like in PERFORMANCE.md and generate PERFORMANCE2.md.
