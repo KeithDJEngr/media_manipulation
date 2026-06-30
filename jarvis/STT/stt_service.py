@@ -434,6 +434,28 @@ async def main():
                         "status": "disconnected",
                     }))
                     logger.info("STT connection closed, reconnecting...")
+
+            # Potentially use later
+            #async with asyncio.timeout(10):
+            #    async with websockets.connect(stt_url, ssl=ssl_context) as websocket:
+            #        await websocket.send(json.dumps({"type": "start"}))
+            #        await websocket.send(json.dumps({
+            #            "type": "service_status",
+            #            "service": "stt",
+            #            "status": "connected",
+            #        }))
+            #        logger.info("STT connected to server")
+            #        try:
+            #            await handle_stt(websocket, stt_service)
+            #        except websockets.ConnectionClosed:
+            #            await websocket.send(json.dumps({
+            #                "type": "service_status",
+            #                "service": "stt",
+            #                "status": "disconnected",
+            #            }))
+            #            logger.info("STT connection closed, reconnecting...")
+        except asyncio.TimeoutError:
+            logger.error("STT handshake timed out, server may be busy")
         except ConnectionRefusedError:
             await websocket_send_status(stt_url, ssl_context, "stt", "disconnected")
             logger.error(

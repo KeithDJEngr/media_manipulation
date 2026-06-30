@@ -7,45 +7,25 @@ The webpage works. It has a transcript with user messages and LLM responses.
 # Remaining tasks
 
 ## General
-- [ ] Conversation history is not working.
-- [ ] LLM response on new msgs is just the same as the first response. Fix the conversation history and counting and see if it's fixed.
-
-## Review
-- [ ] Review the repo. Generate a summary of all the elements involved, how they work together, and all the functionality included in detail.
-
-## Bugs - spin up additional agents to handle these one at a time
-- [ ] Not sure if settings are changing anything or not. Review the logs and see if you can spot anything missing with getting the settings to .
-
-## Performance
-- [ ] Are there any broad changes to make the system more efficient? Do another performance review like in PERFORMANCE.md and generate PERFORMANCE2.md.
-- [ ] What could be done to speed up the TTS or STT, especially STT? Are there other models, ways of retaining loading params, or anything that would still provide good quality but be faster?
+- [ ] Make TTS take LLM in batches (accepting whatever pieces it would generate itself [e.g. sentences])
+- [ ] Make ordering TTS work for multiple message handling. Also stop TTS existing queue and audio if interrupted
+- [ ] Looks like the LLM still fails to stop when I interrup
+- [ ] Saying mute now mutes the microphone so I have to manually push the button because it stops even hearing me. Probably turn that off. And the mute button toggles mute/unmute so I have to say unmute after push the button. Yeah make them desynced.
+- [ ] The reset and stop buttons don't clear the chat history in memory, just on the webpage. Maybe keep escort as the full history but the reset should erase the chat history.
 
 ## New features
 
 ## General
 
 ## Future TODOs
+- [ ] STT parials don't have the history so they're not really good for anything except keeping track that I'm listening.
 
-### Bugs
-- [x] ???When the audio gets too long it appears to fail. Added conversation history truncation (max 20 messages) to prevent memory issues.
-- [x] ???STT didn't appear to work with my mobile browser. Added sample rate detection and resampling to handle mobile browsers.
 
-### Improvements
-- [ ] Audio playback volume control in UI
-- [ ] Listening history panel separate from conversation
-- [ ] Multi-language support (current STT is English-only)
-- [ ] Conversation search
 
-### Performance
-- [x] Reviewed and implemented performance improvements:
-  - Added mobile browser sample rate detection and resampling
-  - Added conversation history truncation (max 20 messages) to prevent memory issues
-  - Added use_full_history toggle to reduce API payload size
-  - Reduced AudioContext buffer size from 1024 to 512 samples for lower latency
-  - Added wake word mute/unmute detection to skip audio processing
 
-### New features
-- [ ] Wake word detection (actual keyword-based, not just always-listening mode)
-- [ ] Advanced audio processing (noise suppression, echo cancellation tuning)
-- [ ] Dark/light theme toggle
-- [ ] Keyboard shortcuts for common actions
+
+# I believe resolved
+
+## General
+- [ ] TTS isn't sending/receiving requests for some reason?
+- [ ] LLM server appears to stop at some points - not sure what's causing it. It's happening rarely with the last commit but with my present changes it's happening very fast and then the server just hangs and all the others fail to get the handshake. Have the logs saved: /tmp/ADDITIONAL_JARVIS_LOGS_LAST_COMMIT_STATE for the original commit.

@@ -404,6 +404,7 @@ async def main():
     ssl_context.check_hostname = False
     ssl_context.verify_mode = ssl.CERT_NONE
     while True:
+
         try:
             async with websockets.connect(vad_url, ssl=ssl_context) as websocket:
                 await websocket.send(json.dumps({"type": "start"}))
@@ -419,12 +420,31 @@ async def main():
                     "service": "vad",
                     "status": "disconnected",
                 }))
+
+        # Potentially use later
+        #    async with asyncio.timeout(10):
+        #        async with websockets.connect(vad_url, ssl=ssl_context) as websocket:
+        #            await websocket.send(json.dumps({"type": "start"}))
+        #            await websocket.send(json.dumps({
+        #                "type": "service_status",
+        #                "service": "vad",
+        #                "status": "connected",
+        #            }))
+        #            logger.info("VAD connected to server")
+        #            await handle_vad_connection(websocket, vad_processor)
+        #            await websocket.send(json.dumps({
+        #                "type": "service_status",
+        #                "service": "vad",
+        #                "status": "disconnected",
+        #            }))
         except websockets.ConnectionClosed:
             logger.info("VAD connection closed, reconnecting...")
+        except asyncio.TimeoutError:
+            logger.error("VAD handshake timed out, server may be busy")
         except ConnectionRefusedError:
             logger.error(
                 f"Could not connect to server at {vad_url}. "
-                "Make sure the server is running on port {server_port}."
+                f"Make sure the server is running on port {server_port}."
             )
             await asyncio.sleep(3)
             continue

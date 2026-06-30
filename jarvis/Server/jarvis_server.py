@@ -7,6 +7,7 @@ import logging
 from pathlib import Path
 from http import HTTPStatus
 from websockets.http11 import Request, Response, Headers
+from websockets.exceptions import InvalidHandshake
 import websockets
 
 HEARTBEAT_TIMEOUT = 15
@@ -18,6 +19,66 @@ BASE_DIR = Path(__file__).parent.parent
 HTML_FILE = BASE_DIR / "ProjectInterface" / "index.html"
 STATIC_DIR = BASE_DIR / "ProjectInterface"
 
+class MessageHistory:
+    """Manages all the message history and sends it to the llm srv"""
+
+    def __init__(self,max_history_msgs):
+        self.max_history_msgs=max_history_msgs
+        self.reset()
+
+    def reset(self):
+        self.history=[]
+        self.last_usr_msg=0
+        self.last_llm_msg=0
+        self.receved_final_usr_msg=False
+        self.receved_final_llm_msg=False
+
+    def add_usr_msg(self,text):
+        msg={'role':'user','content':text}
+        self.last_usr_msg = len(self.history)
+        self.history.append(msg)
+        self.truncate_history()
+
+    def add_llm_msg(self,text):
+        msg={'role':'assistant','content':text}
+        self.last_llm_msg = len(self.history)
+        self.history.append(msg)
+        self.truncate_history()
+
+    def update_last_usr_msg(self,text):
+        if self.last_usr_msg == 0:
+            self.add_usr_msg(text)
+        else:
+            self.history[self.last_usr_msg]["content"] = text
+
+    def update_last_llm_msg(self,text):
+        if self.last_llm_msg == 0:
+            self.add_llm_msg(text)
+        else:
+            self.history[self.last_llm_msg]["content"] = text
+
+    def update_usr_msg(self,text,final=False):
+        if self.receved_final_usr_msg:
+            self.add_usr_msg(text)
+        else:
+            self.update_last_usr_msg(text)
+        self.receved_final_usr_msg=final
+
+    def update_llm_msg(self,text,final=False):
+        if self.receved_final_llm_msg:
+            self.add_llm_msg(text)
+        else:
+            self.update_last_llm_msg(text)
+        self.receved_final_llm_msg=final
+
+    def truncate_history(self):
+        if len(self.history) > self.max_history_msgs:
+            excess = len(self.history) - self.max_history_msgs
+            logger.info(f"Truncating conversation history: removing {excess} messages (limit: {self.max_history_msgs})")
+            self.history[:] = self.history[-self.max_history_msgs:]
+
+
+
 class ConnectionManager:
     """Manages all WebSocket connections and message routing."""
     
@@ -28,8 +89,8 @@ class ConnectionManager:
         self.stt_ws = None
         self.llm_service_ws = None
         self.tts_ws = None
-        self.conversation_history = []
-        self.max_history_messages = 20
+        self.max_history_msgs = 20
+        self.conversation_history_manager = MessageHistory(self.max_history_msgs)
         self.use_full_history = True
         self.service_status = {
             "vad": "offline",
@@ -197,12 +258,8 @@ class ConnectionManager:
             "status": status,
         })
 
-    def truncate_conversation_history(self):
-        """Truncate conversation history to prevent it from growing too large."""
-        if len(self.conversation_history) > self.max_history_messages:
-            excess = len(self.conversation_history) - self.max_history_messages
-            logger.info(f"Truncating conversation history: removing {excess} messages (limit: {self.max_history_messages})")
-            self.conversation_history[:] = self.conversation_history[-self.max_history_messages:]
+
+manager = ConnectionManager()
 
 
 async def create_heartbeat_task(last_heartbeat, handler_cancel_scope):
@@ -233,8 +290,6 @@ async def create_heartbeat_task(last_heartbeat, handler_cancel_scope):
     task = asyncio.create_task(check())
     handler_cancel_scope.append(task)
 
-
-manager = ConnectionManager()
 
 def serve_html_file(connection, request, html_file):
     """Serve HTML file for HTTP requests to / and static files from ProjectInterface."""
@@ -279,8 +334,49 @@ def serve_html_file(connection, request, html_file):
                 headers=headers,
                 body=content,
             )
-
     return None
+
+    #try:
+    #    if request.path == "/":
+    #        if html_file.exists():
+    #            content_type = content_types.get(html_file.suffix, "application/octet-stream")
+    #            content = html_file.read_bytes()
+    #            headers = Headers()
+    #            headers["Content-Type"] = content_type
+    #            return Response(
+    #                status_code=HTTPStatus.OK,
+    #                reason_phrase="OK",
+    #                headers=headers,
+    #                body=content,
+    #            )
+    #        return None
+
+    #    if request.path.startswith("/") and not request.path.startswith("/vad") and not request.path.startswith("/stt") and not request.path.startswith("/llm_service") and not request.path.startswith("/tts"):
+    #        static_file = STATIC_DIR / request.path.lstrip("/")
+    #        if static_file.exists() and static_file.is_file():
+    #            content_type = content_types.get(static_file.suffix, "application/octet-stream")
+    #            content = static_file.read_bytes()
+    #            headers = Headers()
+    #            headers["Content-Type"] = content_type
+    #            return Response(
+    #                status_code=HTTPStatus.OK,
+    #                reason_phrase="OK",
+    #                headers=headers,
+    #                body=content,
+    #            )
+
+    #    return None
+    #except InvalidHandshake:
+    #    headers = Headers()
+    #    headers["Connection"] = "close"
+    #    logger.info(f"Rejected non-WebSocket connection to {request.path}")
+    #    connection.handshake_exc = None
+    #    return Response(
+    #        status_code=HTTPStatus.UPGRADE_REQUIRED,
+    #        reason_phrase="Upgrade Required",
+    #        headers=headers,
+    #        body=b"This is a WebSocket service.\n",
+    #    )
 
 async def handle_client(websocket):
     """Handle browser WebSocket connection."""
@@ -316,14 +412,16 @@ async def handle_client_message(data, websocket):
         await manager.broadcast_to_client({"type": "interrupt"})
         if manager.tts_ws and manager.tts_ws.state.name == "OPEN":
             await manager.tts_ws.send(json.dumps({"type": "stop"}))
+        if manager.llm_service_ws and manager.llm_service_ws.state.name == "OPEN":
+            await manager.llm_service_ws.send(json.dumps({"type": "stop"}))
         logger.info("TTS interrupted by user speech")
 
     elif msg_type == "reset":
-        manager.conversation_history = []
+        manager.conversation_history_manager.reset()
         if manager.tts_ws and manager.tts_ws.state.name == "OPEN":
             await manager.tts_ws.send(json.dumps({"type": "stop_generation"}))
-        if manager.llm_service_ws and manager.llm_service_ws.state.name == "OPEN":
-            await manager.llm_service_ws.send(json.dumps({"type": "reset_history"}))
+        #if manager.llm_service_ws and manager.llm_service_ws.state.name == "OPEN":
+        #    await manager.llm_service_ws.send(json.dumps({"type": "reset_history"}))
         await manager.broadcast_to_client({"type": "reset_complete"})
         logger.info("Conversation reset by user")
 
@@ -542,7 +640,7 @@ async def handle_stt(websocket):
                     logger.info(f"STT -> Server: received audio_chunk chunk_id={data.get('chunk_id')} from VAD (total: {stt_chunk_count})")
                     
                 if msg_type == "partial_transcript":
-                    logger.info(f"original manager.conversation_history: {manager.conversation_history}")
+                    logger.info(f"original manager.conversation_history: {manager.conversation_history_manager.history}")
                     await manager.set_service_active("stt", True)
                     partial_text = data.get("text", "")
                     logger.info("STT partial_transcript: '%s'", partial_text)
@@ -551,61 +649,37 @@ async def handle_stt(websocket):
                         "text": data.get("text", ""),
                         "chunk_id": data.get("chunk_id")
                     })
-                    # Update the latest user message in conversation_history so the LLM sees partials
-                    # If no user message exists yet (first turn), create one
-                    found_user = False
-                    for i in range(len(manager.conversation_history) - 1, -1, -1):
-                        if manager.conversation_history[i]["role"] == "user":
-                            manager.conversation_history[i]["content"] = partial_text
-                            found_user = True
-                            logger.info("Updated partial transcript in conversation_history: '%s'", partial_text)
-                            break
-                    if not found_user:
-                        manager.conversation_history.append({"role": "user", "content": partial_text})
-                        logger.info("Created new user entry in conversation_history for partial: '%s'", partial_text)
-                    manager.truncate_conversation_history()
-                    # Also forward partial to LLM service if it's actively generating
+                    manager.conversation_history_manager.update_usr_msg(partial_text)
                     ws_to_send = manager.llm_service_ws
                     if ws_to_send and ws_to_send.state.name == "OPEN":
                         await ws_to_send.send(json.dumps({
                             "type": "user_input",
                             "text": partial_text,
-                            "history": manager.conversation_history,
+                            "history": manager.conversation_history_manager.history,
                             "partial": True,
                         }))
                     
                 elif msg_type == "final_transcript":
-                    logger.info(f"original manager.conversation_history: {manager.conversation_history}")
+                    logger.info(f"original manager.conversation_history: {manager.conversation_history_manager.history}")
                     await manager.set_service_active("stt", True)
                     await manager.set_service_active("llm", True)
                     user_text = data.get("text", "")
                     logger.info("STT final_transcript: '%s'", user_text)
+                    manager.conversation_history_manager.update_usr_msg(user_text,True)
                     await manager.broadcast_to_client({
                         "type": "user_transcript",
                         "text": user_text,
                         "final": True,
                         "chunk_id": data.get("chunk_id")
                     })
-                    # Update or create user message in conversation_history
-                    found_user = False
-                    for i in range(len(manager.conversation_history) - 1, -1, -1):
-                        if manager.conversation_history[i]["role"] == "user":
-                            manager.conversation_history[i]["content"] = user_text
-                            found_user = True
-                            logger.info("Updated final transcript in conversation_history: '%s'", user_text)
-                            break
-                    if not found_user:
-                        manager.conversation_history.append({"role": "user", "content": user_text})
-                        logger.info("Created new user entry in conversation_history for final transcript: '%s'", user_text)
-                    manager.truncate_conversation_history()
-                    logger.info(f"STT conversation_history before forwarding to LLM: {json.dumps(manager.conversation_history, ensure_ascii=False)}")
+                    logger.info(f"STT conversation_history before forwarding to LLM: {json.dumps(manager.conversation_history_manager.history, ensure_ascii=False)}")
                     # Forward directly to LLM service (not through browser /llm endpoint)
                     ws_to_send = manager.llm_service_ws
                     if ws_to_send and ws_to_send.state.name == "OPEN":
                         await ws_to_send.send(json.dumps({
                             "type": "user_input",
                             "text": user_text,
-                            "history": manager.conversation_history,
+                            "history": manager.conversation_history_manager.history,
                         }))
                         logger.info(f"Forwarded user_input to LLM service")
 
@@ -616,7 +690,7 @@ async def handle_stt(websocket):
                     })
                     logger.info(f"Forwarded wake_word '{data.get('command')}' to browser")
 
-                logger.info(f"manager.conversation_history: {manager.conversation_history}")
+                logger.info(f"manager.conversation_history: {manager.conversation_history_manager.history}")
 
             except json.JSONDecodeError:
                 logger.error("Invalid JSON from STT")
@@ -653,6 +727,11 @@ async def handle_llm_response_messages(websocket, accumulated_text, turn_id_ref,
                 if last_heartbeat:
                     last_heartbeat["llm"] = asyncio.get_event_loop().time()
                 continue
+
+            elif msg_type == "service_status":
+                if data.get("status") == "disconnected":
+                    await manager.unregister_llm(websocket)
+                continue
             
             elif msg_type == "llm_token":
                 await manager.set_service_active("llm", True)
@@ -676,8 +755,7 @@ async def handle_llm_response_messages(websocket, accumulated_text, turn_id_ref,
                     "text": accumulated_text,
                 })
                 if accumulated_text.strip():
-                    manager.conversation_history.append({"role": "assistant", "content": accumulated_text})
-                    manager.truncate_conversation_history()
+                    manager.conversation_history_manager.update_llm_msg(accumulated_text,True)
                 if accumulated_text.strip():
                     await manager.forward_message("llm", "tts", {
                         "type": "tts_input",
@@ -857,7 +935,7 @@ async def main():
         host,
         port,
         ping_interval=30,
-        ping_timeout=60,
+        ping_timeout=70,
         ssl=ssl_context,
         process_request=lambda conn, req: serve_html_file(conn, req, HTML_FILE)
     )

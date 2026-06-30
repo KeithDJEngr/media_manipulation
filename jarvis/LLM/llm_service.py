@@ -38,6 +38,11 @@ LLM_MODEL = os.getenv("LLM_MODEL", "Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressi
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.7"))
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1024"))
 
+use_full_history=True
+
+# Manage stopping llm generation
+continue_generating=True
+
 # System prompt for the LLM
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
@@ -45,14 +50,12 @@ SYSTEM_PROMPT = os.getenv(
     "Keep responses concise but informative and conversational.",
 )
 
-use_full_history = True
-
-
 async def handle_llm(websocket, llm_info):
     """Handle the LLM WebSocket connection."""
-    conversation_history = [
+    pre_history = [
         {"role": "system", "content": SYSTEM_PROMPT}
     ]
+    conversation_history = []
 
     async def send_heartbeats():
         while True:
@@ -63,7 +66,8 @@ async def handle_llm(websocket, llm_info):
                 break
 
     heartbeat_task = asyncio.create_task(send_heartbeats())
-    
+
+    global continue_generating
     try:
         # Signal ready immediately
         await websocket.send(json.dumps({"type": "start"}))
@@ -84,18 +88,16 @@ async def handle_llm(websocket, llm_info):
 
                 msg_type = msg.get("type")
 
-                if msg_type == "reset_history":
-                    logger.info("LLM history reset")
-                    conversation_history = [
-                        {"role": "system", "content": SYSTEM_PROMPT}
-                    ]
-                    continue
-
                 if msg_type == "set_system_prompt":
                     new_prompt = msg.get("prompt", "")
                     if new_prompt:
-                        conversation_history[0] = {"role": "system", "content": new_prompt}
+                        pre_history = {"role": "system", "content": new_prompt}
                         logger.info(f"System prompt updated to: {new_prompt[:80]}...")
+                    continue
+
+                if msg_type == "stop":
+                    continue_generating=False
+                    logger.info(f"Interrupted generation")
                     continue
 
                 if msg_type == "set_settings":
@@ -119,9 +121,9 @@ async def handle_llm(websocket, llm_info):
                         logger.info(f"LLM-SERVICE - got new history from server: {new_history[1:]}")
                         # Keep system prompt, replace rest
                         if len(new_history) > 0 and new_history[0].get("role") == "system":
-                            conversation_history[:] = [{"role": "system", "content": SYSTEM_PROMPT}] + new_history[1:]
+                            conversation_history[:] = pre_history + new_history[1:]
                         else:
-                            conversation_history[:] = [{"role": "system", "content": SYSTEM_PROMPT}] + new_history
+                            conversation_history[:] = pre_history + new_history
                     
                     logger.info(f"LLM-SERVICE <<< user_input (partial={is_partial}, text='{user_text[:80]}...')")
                     
@@ -142,19 +144,6 @@ async def handle_llm(websocket, llm_info):
                     #llm_service.add_user_message(user_text)
                     #async for token in llm_service.generate_response(user_text):
 
-
-
-
-
-
-
-
-
-
-
-
-
-                    # Build messages list with conversation history (respecting use_full_history setting)
                     if use_full_history:
                         messages = conversation_history.copy()
                     else:
@@ -178,12 +167,12 @@ async def handle_llm(websocket, llm_info):
                         "max_tokens": llm_info.get('max_tokens', LLM_MAX_TOKENS),
                     }
 
-                    generation_ok = False
+                    continue_generating=True
                     try:
                         logger.info(f"Connecting to {llm_info['api_url']}...")
                         llm_msg=""
 
-                        # Use AsyncClient with a 60s timeout (handles connect, read, and write delays)
+                        # Use AsyncClient with a timeout (handles connect, read, and write delays)
                         async with httpx.AsyncClient(timeout=240) as client:
 
                             # CRITICAL CHANGE: Use .stream("POST", ...) instead of .post()
@@ -192,13 +181,15 @@ async def handle_llm(websocket, llm_info):
                             async with client.stream("POST", llm_info['api_url'], json=payload) as response:
                                 if response.status_code != 200:
                                     logger.info(f"Error: {response.status_code}")
-                                    generation_ok = True
                                     break
 
                                 logger.info("Receiving Stream:\n")
 
                                 # aiter_lines is the non-blocking equivalent of requests' iter_lines
                                 async for line in response.aiter_lines():
+                                    if not continue_generating:
+                                        continue_generating=True
+                                        break
                                     if not line:
                                         continue
 
@@ -227,13 +218,11 @@ async def handle_llm(websocket, llm_info):
                                                     await websocket.send(json.dumps({"type": "llm_token", "text": token, "partial": True}))
                                                 except websockets.ConnectionClosed:
                                                     logger.info("WebSocket closed during token streaming")
-                                                    generation_ok = True
                                                     break
 
                                     except json.JSONDecodeError:
                                         continue
 
-                                generation_ok = True
                                 logger.info(f"\n\nDone. Total tokens streamed: {token_count}")
 
                     except httpx.ConnectError:
@@ -242,13 +231,12 @@ async def handle_llm(websocket, llm_info):
                         logger.info(f"An error occurred: {e}")
 
 
-
+                    # TODO: clear when it's validated this works without
                     # Add to conversation history (user message already in history from server)
-                    conversation_history.append({"role": "assistant", "content": llm_msg})
-
+                    #conversation_history.append({"role": "assistant", "content": llm_msg})
                     # Trim history to keep last 20 messages (system prompt + 19 turns) to manage context window
-                    if len(conversation_history) > 21:
-                        conversation_history = conversation_history[-19:]
+                    #if len(conversation_history) > 21:
+                    #    conversation_history = conversation_history[-19:]
 
                     # Send end signal with accumulated text
                     logger.info(f"LLM-SERVICE: sending llm_end (total_text_len={len(llm_msg)}, text='{llm_msg[:100]}...')")
@@ -327,18 +315,43 @@ async def main():
                 }))
                 logger.info("LLM connected to server")
                 await handle_llm(websocket, llm_info)
-                logger.info("LLM service handler completed, reconnecting...")
+                await websocket.send(json.dumps({
+                    "type": "service_status",
+                    "service": "llm",
+                    "status": "disconnected",
+                }))
+
+
+        # Potentially use later
+        #try:
+        #    async with asyncio.timeout(10):
+        #        async with websockets.connect(service_llm_socket, ssl=ssl_context) as websocket:
+        #            await websocket.send(json.dumps({"type": "start"}))
+        #            await websocket.send(json.dumps({
+        #                "type": "service_status",
+        #                "service": "llm",
+        #                "status": "connected",
+        #            }))
+        #            logger.info("LLM connected to server")
+        #            await handle_llm(websocket, llm_info)
+        #except websockets.ConnectionClosed as e:
+        #    logger.info(f"LLM connection closed: {e}, reconnecting...")
+        #    try:
+        #        async with asyncio.timeout(10):
+        #            async with websockets.connect(service_llm_socket, ssl=ssl_context) as ws:
+        #                await ws.send(json.dumps({
+        #                    "type": "service_status",
+        #                    "service": "llm",
+        #                    "status": "disconnected",
+        #                }))
+
+
+        #    except Exception:
+        #        pass
         except websockets.ConnectionClosed as e:
             logger.info(f"LLM connection closed: {e}, reconnecting...")
-            try:
-                async with websockets.connect(service_llm_socket, ssl=ssl_context) as ws:
-                    await ws.send(json.dumps({
-                        "type": "service_status",
-                        "service": "llm",
-                        "status": "disconnected",
-                    }))
-            except Exception:
-                pass
+        except asyncio.TimeoutError:
+            logger.error("LLM handshake timed out, server may be busy")
         except ConnectionRefusedError:
             logger.error(
                 f"Could not connect to server at {service_llm_socket}. "
