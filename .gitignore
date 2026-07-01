@@ -3,3 +3,6 @@ jarvis/localhost+2.pem
 jarvis/STT/__pycache__
 jarvis/Server/__pycache__
 jarvis/TTS/__pycache__
+jarvis/b70_output.wav
+jarvis/kokoro_output_0.wav
+jarvis/qwen3_generation_output.wav

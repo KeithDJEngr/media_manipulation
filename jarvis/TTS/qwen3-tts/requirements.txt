@@ -1,0 +1,6 @@
+onnxruntime-openvino
+soundfile
+jinja2
+llama-cpp-python
+numpy
+qwen-tts

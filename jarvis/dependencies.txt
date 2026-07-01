@@ -1,0 +1,11 @@
+# Install Intel compute stack, Level Zero loaders, and phonemizer dependencies
+sudo pacman -Syy
+sudo pacman -S level-zero-loader intel-compute-runtime espeak-ng git git-lfs python-pip python-virtualenv
+
+
+#
+python -m venv tts_env
+source tts_env/bin/activate
+
+# Upgrade pip and install PyTorch XPU wheels
+pip install --upgrade pip
