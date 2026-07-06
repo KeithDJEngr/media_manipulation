@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import ssl
+import time as _time
 
 # Guard Level Zero GPU enumeration before torch import (same fix as STT service)
 _ze_mask_before = os.environ.get("ZE_AFFINITY_MASK")
@@ -33,6 +34,7 @@ import torch
 import websockets
 import soundfile as sf
 from qwen_tts import Qwen3TTSModel
+from kokoro import KPipeline
 
 if _ze_mask_before is not None:
     os.environ["ZE_AFFINITY_MASK"] = _ze_mask_before
@@ -53,11 +55,13 @@ SAMPLE_RATE = 16000
 #   Qwen3-TTS-12Hz-1.7B-CustomVoice - Slower, ~10-30s generation, best quality
 TTS_MODEL_TIER = os.getenv("TTS_MODEL_TIER", "1.7B")
 TTS_MODEL_MAP = {
+    "Kokoro": "Kokoro",
     "0.6B-Base": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
     "0.6B-CustomVoice": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
     "1.7B": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
 }
-TTS_MODEL = os.getenv("TTS_MODEL", TTS_MODEL_MAP.get(TTS_MODEL_TIER, TTS_MODEL_MAP["1.7B"]))
+#TTS_MODEL = os.getenv("TTS_MODEL", TTS_MODEL_MAP.get(TTS_MODEL_TIER, TTS_MODEL_MAP["1.7B"]))
+TTS_MODEL = "Kokoro"
 TTS_DEVICE = os.getenv("TTS_DEVICE", "xpu")
 TTS_DTYPE = os.getenv("TTS_DTYPE", "float32")
 TTS_VOICE_INSTRUCT = os.getenv(
@@ -73,6 +77,296 @@ TTS_MIN_CHUNK_WORDS = int(os.getenv("TTS_MIN_CHUNK_WORDS", "8"))  # Minimum word
 # Sentence boundary regex
 SENTENCE_RE = re.compile(r'[.!?]\s+|[.!?]$')
 
+class TTSHandler:
+    """TTS handling with chunked streaming support.
+
+    Accumulates text from partial LLM tokens, processes sentence-sized
+    chunks for low-latency audio generation, and handles interruptions
+    when the user speaks again.
+    """
+
+    """
+    Methods to keep in TTSHandler
+    accumulate_text
+    reset_buffer
+    generate_sentences_in_order
+    current_turn_id
+    interrupt
+
+    split_into_sentences
+    generate_audio_chunks
+
+    new:
+    set_speaker
+    set_voice_instruct
+
+
+    Methods that are for TTSProcessor
+    _process_chunk
+
+    """
+
+    def __init__(self, tts_processor):
+        self.tts_processor = tts_processor
+
+        self.processed_words = 0
+        self.current_turn_id = None
+        self.current_chunk_text = ""
+        self.last_generated_text = ""
+        self.last_generated_len = 0
+
+        self.is_generating = False
+        self.text_buffer = ""
+
+    def set_speaker(self,speaker):
+        self.tts_processor.speaker=speaker
+        self.tts_processor.reload_model()
+
+    def set_voice_instruct(self,voice_instruct):
+        self.tts_processor.voice_instruct=voice_instruct
+        self.tts_processor.reload_model()
+
+    def accumulate_text(self, text, partial=True):
+        """Accumulate text from LLM tokens.
+
+        Args:
+            text: Text chunk from LLM (accumulated so far)
+            partial: Whether more tokens are coming
+
+        Yields:
+            dict with audio_chunk data when a chunk is ready
+        """
+        if not text:
+            return
+
+        if partial:
+            current_words = len(text.split())
+            new_words = current_words - self.processed_words
+            if new_words <= 0:
+                return
+
+            # Extract only the new words that haven't been processed yet
+            words = text.split()
+            new_text = " ".join(words[self.processed_words:])
+            self.current_chunk_text += (" " if self.current_chunk_text else "") + new_text
+            self.processed_words = current_words
+
+            # Check if we should process this chunk
+            should_process = (
+                self._has_sentence_boundary(text) or
+                len(self.current_chunk_text.split()) >= TTS_CHUNK_WORDS or
+                len(self.current_chunk_text) >= 150
+            )
+
+            if should_process:
+                chunk_to_process = self.current_chunk_text
+                self.current_chunk_text = ""
+                self.processed_words = current_words
+                yield self.tts_processor._process_chunk(chunk_to_process)
+        else:
+            # Final token - process remaining text
+            current_words = len(text.split())
+            new_words = current_words - self.processed_words
+            if new_words > 0:
+                words = text.split()
+                self.current_chunk_text += (" " if self.current_chunk_text else "") + " ".join(words[self.processed_words:])
+                yield self.tts_processor._process_chunk(self.current_chunk_text)
+            self.processed_words = 0
+            self.current_chunk_text = ""
+
+    def _has_sentence_boundary(self, text):
+        """Check if text contains a sentence boundary."""
+        return bool(SENTENCE_RE.search(text))
+
+    def reset_buffer(self, turn_id=None):
+        """Reset for new response."""
+        self.text_buffer = ""
+        self.current_chunk_text = ""
+        self.processed_words = 0
+        self.last_generated_text = ""
+        self.last_generated_len = 0
+        self.tts_processor.interrupt_event.clear()
+        self.current_turn_id = turn_id
+        # Note: keep last_generated_text/len to avoid regenerating prefixes of previous responses
+
+    def interrupt(self):
+        """Signal interruption (user started speaking again)."""
+        self.tts_processor.interrupt_event.set()
+
+    def split_into_sentences(self, text):
+        """Split text into sentences using sentence boundary detection.
+
+        Preserves sentence-ending punctuation. Returns list of sentences.
+        """
+        stripped = text.strip()
+        if not stripped:
+            return []
+
+        # Split on sentence boundaries while preserving the delimiter
+        sentences = re.split(r'(?<=[.!?])\s+', stripped)
+
+        # Filter empty sentences
+        result = [s.strip() for s in sentences if s.strip()]
+        return result
+
+    def generate_audio_chunks(self, text):
+        """Generator that yields audio chunks from text.
+
+        Skips redundant generation - if the same text has already been generated
+        (from a previous partial message), skips to avoid regenerating audio.
+        Also skips shorter texts that are prefixes of already-generated text,
+        since they will be replaced by the longer version anyway.
+        """
+        stripped = text.strip()
+        if not stripped:
+            return
+        if stripped == self.last_generated_text:
+            return
+        # Skip if this text is shorter than what we've already generated
+        # and is a prefix of it (will be replaced by the longer version)
+        if len(stripped) < self.last_generated_len and self.last_generated_text.startswith(stripped):
+            return
+        self.last_generated_text = stripped
+        self.last_generated_len = len(stripped)
+
+        for result in self.tts_processor._process_chunk(stripped):
+            if self.tts_processor.interrupt_event.is_set():
+                logger.info("TTS interrupted, stopping generation")
+                yield {
+                    "type": "audio_chunk",
+                    "audio": "",
+                    "chunk_id": -1,
+                    "interrupted": True,
+                }
+                return
+            yield result
+
+    def generate_sentences_in_order(self, text):
+        """Generate audio for each sentence in order.
+
+        Splits text into sentences and generates audio for each one
+        sequentially (in order), yielding audio chunks as they're ready.
+        This ensures sentences play in the same order they were generated.
+        """
+        stripped = text.strip()
+        if not stripped:
+            return
+
+        sentences = self.split_into_sentences(stripped)
+        if not sentences:
+            # No clear sentence boundaries, process as single chunk
+            for chunk in self.generate_audio_chunks(stripped):
+                yield chunk
+            return
+
+        logger.info(f"Split text into {len(sentences)} sentences for TTS")
+
+        for i, sentence in enumerate(sentences):
+            if self.tts_processor.interrupt_event.is_set():
+                logger.info("TTS interrupted during sentence processing")
+                yield {
+                    "type": "audio_chunk",
+                    "audio": "",
+                    "chunk_id": -1,
+                    "interrupted": True,
+                }
+                return
+
+            logger.info(f"Generating audio for sentence {i+1}/{len(sentences)}: \"{sentence[:60]}...\"")
+
+            for chunk in self.generate_audio_chunks(sentence):
+                if chunk.get("interrupted"):
+                    yield chunk
+                    return
+                chunk["sentence_index"] = i
+                chunk["total_sentences"] = len(sentences)
+                yield chunk
+
+
+
+#class TTSProcessor:
+#    """
+#    Attempting to handle TTS Processors simpler but for now just template to copy to any new TTSProcessor
+#    """
+#
+#    def __init__(self):
+
+
+class KokoroTTSProcessor:
+    """
+    __init__(self)
+    _load_model(self)
+    _reload_model(self)
+    _interrupt(self)
+    _process_chunk(self,text)
+    """
+
+    def __init__(self,device="xpu",speaker="af_sarah",model_path=None,voice_instruct=None,language="en"):
+        self.interrupt_event = asyncio.Event()
+        self.text_buffer = ""
+        self.current_chunk_text = ""
+        self.processed_words = 0
+        self.speaker = speaker
+        self.model_path = model_path
+        self.device = device
+        self.voice_instruct = voice_instruct
+        self.language = language
+        self._model_loaded = False
+        self._load_model()
+
+    def _load_model(self):
+        self._reload_model()
+
+    def _reload_model(self):
+        # Initialize pipeline
+        self.pipeline = KPipeline(lang_code='a', device=self.device)
+
+    def interrupt(self):
+        self.interrupt_event.set()
+        # TODO: make this actually implementing in the processing
+
+    def _process_chunk(self,text):
+        if not text or not text.strip():
+            return
+
+        logger.info(f"TTS synthesizing chunk: \"{text[:80]}...\"")
+        gen_start = _time.time()
+
+        try:
+            # Generate generator object (uses default voice 'af_sarah')
+            generator = self.pipeline(text, voice=self.speaker, speed=1.0, split_pattern=r'\n+')
+
+            gen_time = _time.time() - gen_start
+            logger.info(f"Model generation done in {gen_time:.1f}s")
+
+
+            for i, (gs, ps, audio) in enumerate(generator):
+                audio_np = audio.cpu().numpy().astype(np.float32)
+                if audio_np.dtype != np.float32:
+                    audio_np = audio_np.astype(np.float32)
+                sr = 24000
+                if sr != SAMPLE_RATE:
+                    logger.info(f"Resampling kokoro audio from {sr} to {SAMPLE_RATE}")
+                    audio_np = _resample(audio_np, sr, SAMPLE_RATE)
+                chunk_size = int(SAMPLE_RATE * 0.5)
+                num_samples = len(audio_np)
+                for start in range(0, num_samples, chunk_size):
+                    end = min(start + chunk_size, num_samples)
+                    chunk = audio_np[start:end]
+                    peak = np.max(np.abs(chunk))
+                    if peak > 1.0:
+                        chunk = chunk / peak
+                    audio_bytes = chunk.astype(np.float32).tobytes()
+                    audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+                    yield {
+                        "type": "audio_chunk",
+                        "audio": audio_b64,
+                        "chunk_id": start // chunk_size,
+                        "sample_rate": SAMPLE_RATE,
+                    }
+        except Exception as e:
+            logger.error(f"STT _process_chunk failed with error ({e})")
+
 
 class QwenTTSProcessor:
     """Qwen3-TTS processor with chunked streaming support.
@@ -83,15 +377,11 @@ class QwenTTSProcessor:
     """
 
     def __init__(self, model_path, device, dtype_str, voice_instruct, language, speaker):
-        self.is_generating = False
         self.interrupt_event = asyncio.Event()
         self.text_buffer = ""
         self.current_chunk_text = ""
         self.processed_words = 0
         self.speaker = speaker
-        self.last_generated_text = ""
-        self.last_generated_len = 0
-        self.current_turn_id = None
         self.model_path = model_path
         self.device = device
         self.dtype_str = dtype_str
@@ -133,8 +423,8 @@ class QwenTTSProcessor:
             raise
 
     def reload_model(self):
-        """Reload the model (used after DEVICE_LOST error)."""
-        logger.info("Reloading TTS model after device error...")
+        """Reload the model."""
+        logger.info("Reloading TTS model...")
         # Free GPU memory
         if hasattr(self, 'model') and self.model is not None:
             del self.model
@@ -157,72 +447,9 @@ class QwenTTSProcessor:
         except Exception as e:
             logger.warning(f"Re-warm failed: {e}")
 
-    def accumulate_text(self, text, partial=True):
-        """Accumulate text from LLM tokens.
-
-        Args:
-            text: Text chunk from LLM (accumulated so far)
-            partial: Whether more tokens are coming
-
-        Yields:
-            dict with audio_chunk data when a chunk is ready
-        """
-        if not text:
-            return
-
-        if partial:
-            current_words = len(text.split())
-            new_words = current_words - self.processed_words
-            if new_words <= 0:
-                return
-
-            # Extract only the new words that haven't been processed yet
-            words = text.split()
-            new_text = " ".join(words[self.processed_words:])
-            self.current_chunk_text += (" " if self.current_chunk_text else "") + new_text
-            self.processed_words = current_words
-
-            # Check if we should process this chunk
-            should_process = (
-                self._has_sentence_boundary(text) or
-                len(self.current_chunk_text.split()) >= TTS_CHUNK_WORDS or
-                len(self.current_chunk_text) >= 150
-            )
-
-            if should_process:
-                chunk_to_process = self.current_chunk_text
-                self.current_chunk_text = ""
-                self.processed_words = current_words
-                yield self._process_chunk(chunk_to_process)
-        else:
-            # Final token - process remaining text
-            current_words = len(text.split())
-            new_words = current_words - self.processed_words
-            if new_words > 0:
-                words = text.split()
-                self.current_chunk_text += (" " if self.current_chunk_text else "") + " ".join(words[self.processed_words:])
-                yield self._process_chunk(self.current_chunk_text)
-            self.processed_words = 0
-            self.current_chunk_text = ""
-
-    def reset_buffer(self, turn_id=None):
-        """Reset for new response."""
-        self.text_buffer = ""
-        self.current_chunk_text = ""
-        self.processed_words = 0
-        self.last_generated_text = ""
-        self.last_generated_len = 0
-        self.interrupt_event.clear()
-        self.current_turn_id = turn_id
-        # Note: keep last_generated_text/len to avoid regenerating prefixes of previous responses
-
     def interrupt(self):
         """Signal interruption (user started speaking again)."""
         self.interrupt_event.set()
-
-    def _has_sentence_boundary(self, text):
-        """Check if text contains a sentence boundary."""
-        return bool(SENTENCE_RE.search(text))
 
     def _process_chunk(self, text):
         """Process a text chunk and yield audio chunks.
@@ -233,8 +460,6 @@ class QwenTTSProcessor:
         Yields:
             dict with audio_chunk data
         """
-        import time as _time
-
         if not text or not text.strip():
             return
 
@@ -348,96 +573,6 @@ class QwenTTSProcessor:
             else:
                 logger.error(f"TTS generation error: {e}")
 
-    def split_into_sentences(self, text):
-        """Split text into sentences using sentence boundary detection.
-        
-        Preserves sentence-ending punctuation. Returns list of sentences.
-        """
-        stripped = text.strip()
-        if not stripped:
-            return []
-        
-        # Split on sentence boundaries while preserving the delimiter
-        sentences = re.split(r'(?<=[.!?])\s+', stripped)
-        
-        # Filter empty sentences
-        result = [s.strip() for s in sentences if s.strip()]
-        return result
-
-    def generate_audio_chunks(self, text):
-        """Generator that yields audio chunks from text.
-
-        Skips redundant generation - if the same text has already been generated
-        (from a previous partial message), skips to avoid regenerating audio.
-        Also skips shorter texts that are prefixes of already-generated text,
-        since they will be replaced by the longer version anyway.
-        """
-        stripped = text.strip()
-        if not stripped:
-            return
-        if stripped == self.last_generated_text:
-            return
-        # Skip if this text is shorter than what we've already generated
-        # and is a prefix of it (will be replaced by the longer version)
-        if len(stripped) < self.last_generated_len and self.last_generated_text.startswith(stripped):
-            return
-        self.last_generated_text = stripped
-        self.last_generated_len = len(stripped)
-
-        for result in self._process_chunk(stripped):
-            if self.interrupt_event.is_set():
-                logger.info("TTS interrupted, stopping generation")
-                yield {
-                    "type": "audio_chunk",
-                    "audio": "",
-                    "chunk_id": -1,
-                    "interrupted": True,
-                }
-                return
-            yield result
-
-    def generate_sentences_in_order(self, text):
-        """Generate audio for each sentence in order.
-        
-        Splits text into sentences and generates audio for each one
-        sequentially (in order), yielding audio chunks as they're ready.
-        This ensures sentences play in the same order they were generated.
-        """
-        stripped = text.strip()
-        if not stripped:
-            return
-        
-        sentences = self.split_into_sentences(stripped)
-        if not sentences:
-            # No clear sentence boundaries, process as single chunk
-            for chunk in self.generate_audio_chunks(stripped):
-                yield chunk
-            return
-        
-        logger.info(f"Split text into {len(sentences)} sentences for TTS")
-        
-        for i, sentence in enumerate(sentences):
-            if self.interrupt_event.is_set():
-                logger.info("TTS interrupted during sentence processing")
-                yield {
-                    "type": "audio_chunk",
-                    "audio": "",
-                    "chunk_id": -1,
-                    "interrupted": True,
-                }
-                return
-            
-            logger.info(f"Generating audio for sentence {i+1}/{len(sentences)}: \"{sentence[:60]}...\"")
-            
-            for chunk in self.generate_audio_chunks(sentence):
-                if chunk.get("interrupted"):
-                    yield chunk
-                    return
-                chunk["sentence_index"] = i
-                chunk["total_sentences"] = len(sentences)
-                yield chunk
-
-
 def _parse_dtype(dtype_str):
     """Parse dtype string to torch.dtype."""
     dtype_map = {
@@ -465,7 +600,7 @@ def _resample(audio, from_sr, to_sr):
         return np.interp(indices, np.arange(len(audio)), audio)
 
 
-async def handle_tts(websocket, tts_processor):
+async def handle_tts(websocket, tts_handler):
     """Handle the TTS WebSocket connection."""
     async def send_heartbeats():
         while True:
@@ -518,7 +653,7 @@ async def handle_tts(websocket, tts_processor):
                     # Reset buffer on new complete response
                     if not partial:
                         global_audio_seq = 0
-                        tts_processor.reset_buffer(turn_id)
+                        tts_handler.reset_buffer(turn_id)
 
                     async def process_tts_input():
                         nonlocal global_audio_seq
@@ -528,14 +663,14 @@ async def handle_tts(websocket, tts_processor):
                             try:
                                 if partial:
                                     # Partial token - accumulate and process incrementally
-                                    for chunk in tts_processor.accumulate_text(text, partial=True):
+                                    for chunk in tts_handler.accumulate_text(text, partial=True):
                                         if isinstance(chunk, dict):
                                             logger.info(f"Partial Queuing audio")
                                             chunk_queue.put_nowait(chunk)
                                             logger.info(f"... Queued audio")
                                 else:
                                     # Complete response - process sentence by sentence in order
-                                    for chunk in tts_processor.generate_sentences_in_order(text):
+                                    for chunk in tts_handler.generate_sentences_in_order(text):
                                         logger.info(f"Complete Queuing audio")
                                         chunk_queue.put_nowait(chunk)
                                         logger.info(f"... Queued audio")
@@ -552,7 +687,7 @@ async def handle_tts(websocket, tts_processor):
                                     break
                                 chunk["audio_seq"] = global_audio_seq
                                 global_audio_seq += 1
-                                chunk["turn_id"] = tts_processor.current_turn_id
+                                chunk["turn_id"] = tts_handler.current_turn_id
                                 await websocket.send(json.dumps(chunk))
                                 logger.info(f"sending audio") #: {chunk}
                                 local_chunk_id += 1
@@ -570,7 +705,7 @@ async def handle_tts(websocket, tts_processor):
                                     break
                                 chunk["audio_seq"] = global_audio_seq
                                 global_audio_seq += 1
-                                chunk["turn_id"] = tts_processor.current_turn_id
+                                chunk["turn_id"] = tts_handler.current_turn_id
                                 await websocket.send(json.dumps(chunk))
                                 local_chunk_id += 1
                             except Exception:
@@ -579,7 +714,7 @@ async def handle_tts(websocket, tts_processor):
                         await websocket.send(json.dumps({
                             "type": "audio_end",
                             "total_chunks": local_chunk_id,
-                            "turn_id": tts_processor.current_turn_id,
+                            "turn_id": tts_handler.current_turn_id,
                         }))
                         if local_chunk_id > 0:
                             logger.info(f"TTS generation complete ({local_chunk_id} chunks)")
@@ -593,11 +728,11 @@ async def handle_tts(websocket, tts_processor):
                     )
 
                 elif msg_type == "stop_generation":
-                    tts_processor.interrupt()
+                    tts_handler.interrupt()
                     await websocket.send(json.dumps({
                         "type": "audio_end",
                         "interrupted": True,
-                        "turn_id": tts_processor.current_turn_id,
+                        "turn_id": tts_handler.current_turn_id,
                     }))
                     logger.info("TTS generation stopped (interrupt)")
 
@@ -605,10 +740,10 @@ async def handle_tts(websocket, tts_processor):
                     speaker = msg.get("speaker", msg.get("voice"))
                     instruct = msg.get("instruct")
                     if speaker:
-                        tts_processor.speaker = speaker
+                        tts_handler.set_speaker(speaker)
                     if instruct:
-                        tts_processor.voice_instruct = instruct
-                    logger.info(f"TTS voice/instruct changed: speaker={tts_processor.speaker}, instruct={tts_processor.voice_instruct[:50]}")
+                        tts_handler.tts_processor.set_voice_instruct = instruct
+                    logger.info(f"TTS voice/instruct changed: speaker={speaker}, instruct={instruct[:50]}")
 
             except json.JSONDecodeError as e:
                 logger.error(f"Invalid JSON from server: {e}")
@@ -635,13 +770,23 @@ async def main():
 
     # Create TTS processor (loads and pre-warms model)
     logger.info(f"Initializing Qwen3-TTS with model: {TTS_MODEL}")
-    tts_processor = QwenTTSProcessor(
-        model_path=TTS_MODEL,
-        device=TTS_DEVICE,
-        dtype_str=TTS_DTYPE,
-        voice_instruct=TTS_VOICE_INSTRUCT,
-        language=TTS_LANGUAGE,
-        speaker=TTS_SPEAKER,
+    if TTS_MODEL.find("Kokoro") > -1:
+        tts_processor = KokoroTTSProcessor()
+    elif TTS_MODEL.find("Qwen") > -1:
+        tts_processor = QwenTTSProcessor(
+            model_path=TTS_MODEL,
+            device=TTS_DEVICE,
+            dtype_str=TTS_DTYPE,
+            voice_instruct=TTS_VOICE_INSTRUCT,
+            language=TTS_LANGUAGE,
+            speaker=TTS_SPEAKER,
+           )
+    else:
+        logger.error("Unknown TTS model specified")
+        raise
+
+    tts_handler = TTSHandler(
+        tts_processor=tts_processor
     )
 
     # Connect to server
@@ -659,7 +804,7 @@ async def main():
                     "status": "connected",
                 }))
                 logger.info("TTS connected to server")
-                await handle_tts(websocket, tts_processor)
+                await handle_tts(websocket, tts_handler)
                 await websocket.send(json.dumps({
                     "type": "service_status",
                     "service": "tts",
