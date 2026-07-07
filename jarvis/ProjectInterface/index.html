@@ -997,7 +997,6 @@
                     case 'wake_word':
                         console.log('[WS] Wake word detected:', data.command);
                         if (data.command === 'mute') {
-                            isMuted = true;
                             if (muteBtn) {
                                 muteBtn.textContent = '🔇';
                                 muteBtn.title = 'Unmute microphone';

@@ -100,6 +100,11 @@ async def handle_llm(websocket, llm_info):
                     logger.info(f"Interrupted generation")
                     continue
 
+                if msg_type == "reset_history":
+                    logger.info(f"Resetting LLM conversation history")
+                    conversation_history[:] = pre_history
+                    continue
+
                 if msg_type == "set_settings":
                     if "use_full_history" in msg:
                         global use_full_history

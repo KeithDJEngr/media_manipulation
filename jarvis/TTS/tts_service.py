@@ -303,9 +303,6 @@ class KokoroTTSProcessor:
 
     def __init__(self,device="xpu",speaker="af_sarah",model_path=None,voice_instruct=None,language="en"):
         self.interrupt_event = asyncio.Event()
-        self.text_buffer = ""
-        self.current_chunk_text = ""
-        self.processed_words = 0
         self.speaker = speaker
         self.model_path = model_path
         self.device = device
@@ -328,6 +325,12 @@ class KokoroTTSProcessor:
     def _process_chunk(self,text):
         if not text or not text.strip():
             return
+
+        # Kokoro doesn't handle certain characters well. Remove them.
+        remove_characters_list=["**","\n"]
+        for n in remove_list:
+            if a.find(n) > -1:
+                a.replace(n,"")
 
         logger.info(f"TTS synthesizing chunk: \"{text[:80]}...\"")
         gen_start = _time.time()
@@ -629,6 +632,7 @@ async def handle_tts(websocket, tts_handler):
 
         # Global audio sequence counter for ordering chunks across responses
         global_audio_seq = 0
+        current_tts_task = None
 
         # Process incoming messages
         async for message in websocket:
@@ -656,7 +660,8 @@ async def handle_tts(websocket, tts_handler):
                         tts_handler.reset_buffer(turn_id)
 
                     async def process_tts_input():
-                        nonlocal global_audio_seq
+                        nonlocal global_audio_seq, current_tts_task
+                        current_tts_task = asyncio.current_task()
                         local_chunk_id = 0
 
                         def generate_chunks():
@@ -722,13 +727,15 @@ async def handle_tts(websocket, tts_handler):
                     chunk_queue: asyncio.Queue = asyncio.Queue()
                     generation_complete = asyncio.Event()
                     logger.info("starting task: process_tts_input()")
-                    task = asyncio.create_task(process_tts_input())
-                    task.add_done_callback(
+                    current_tts_task = asyncio.create_task(process_tts_input())
+                    current_tts_task.add_done_callback(
                         lambda t: logger.error(f"TTS task error: {t.exception()}") if t.exception() else None
                     )
 
-                elif msg_type == "stop_generation":
+                elif msg_type == "stop_generation" or msg_type == "stop":
                     tts_handler.interrupt()
+                    if current_tts_task and not current_tts_task.done():
+                        current_tts_task.cancel()
                     await websocket.send(json.dumps({
                         "type": "audio_end",
                         "interrupted": True,

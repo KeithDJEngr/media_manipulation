@@ -420,8 +420,8 @@ async def handle_client_message(data, websocket):
         manager.conversation_history_manager.reset()
         if manager.tts_ws and manager.tts_ws.state.name == "OPEN":
             await manager.tts_ws.send(json.dumps({"type": "stop_generation"}))
-        #if manager.llm_service_ws and manager.llm_service_ws.state.name == "OPEN":
-        #    await manager.llm_service_ws.send(json.dumps({"type": "reset_history"}))
+        if manager.llm_service_ws and manager.llm_service_ws.state.name == "OPEN":
+            await manager.llm_service_ws.send(json.dumps({"type": "reset_history"}))
         await manager.broadcast_to_client({"type": "reset_complete"})
         logger.info("Conversation reset by user")
 
