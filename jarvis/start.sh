@@ -13,6 +13,8 @@
 #   STT_MODEL: Parakeet model name (default: nvidia/parakeet-tdt-0.6b-v3)
 #   LLM_API_URL: External LLM API URL (default: http://192.168.0.121:8000/chat/completions)
 #   LLM_MODEL: LLM model name for API calls (default: dummy)
+#   LLM_MAX_TOKENS: Max tokens per LLM response (default: 2048)
+#   LLM_DISABLE_THINKING: Disable Qwen3 thinking mode (default: 1; set 0 to keep thinking)
 
 # Parse arguments
 #HOST=${1:-${HOST:-0.0.0.0}}
@@ -25,13 +27,17 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 /bin/bash stop.sh $HOST $PORT || true
 
+STT_DEVICE=${STT_DEVICE:-auto}
+STT_MODEL=${STT_MODEL:-nvidia/parakeet-tdt-0.6b-v3}
+LLM_API_URL=${LLM_API_URL:-http://192.168.0.118:8000/chat/completions}
+
 echo "========================================"
 echo "  Jarvis Speech-to-Speech Pipeline"
 echo "========================================"
 echo "Server: https://${HOST}:${PORT}"
-echo "STT Device: ${STT_DEVICE:-auto}"
-echo "STT Model: ${STT_MODEL:-nvidia/parakeet-tdt-0.6b-v3}"
-echo "LLM API: ${LLM_API_URL:-http://192.168.0.121:8000/chat/completions}"
+echo "STT Device: ${STT_DEVICE}"
+echo "STT Model: ${STT_MODEL}"
+echo "LLM API: ${LLM_API_URL}"
 echo ""
 
 # Dependencies required
@@ -129,6 +135,15 @@ if ! ss -tlnp 2>/dev/null | grep -q ":${PORT} "; then
     cat /tmp/jarvis_server.log
     exit 1
 fi
+# Guard: the port must be held by the server we just started, not a stale
+# process left over from a previous run (stop.sh can fail to clear it).
+OWNER_PID=$(ss -tlnp 2>/dev/null | grep ":${PORT} " | head -1 | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
+if [ -n "$OWNER_PID" ] && [ "$OWNER_PID" != "$SERVER_PID" ]; then
+    echo "ERROR: port ${PORT} is held by pid ${OWNER_PID} (stale process), not this server (pid ${SERVER_PID})."
+    echo "Run ./stop.sh (or: kill ${OWNER_PID}) and retry."
+    ss -tlnp | grep ":${PORT} "
+    exit 1
+fi
 
 # Start VAD service
 echo "Starting VAD service..."
@@ -147,7 +162,7 @@ disown $STT_PID
 
 # Start LLM service
 echo "Starting LLM service..."
-SERVER_HOST=${HOST} SERVER_PORT=${PORT} LLM_API_URL=${LLM_API_URL:-http://192.168.0.121:8000/chat/completions} LLM_MODEL=${LLM_MODEL:-dummy} nohup .venv/bin/python LLM/llm_service.py > /tmp/jarvis_llm.log 2>&1 &
+SERVER_HOST=${HOST} SERVER_PORT=${PORT} LLM_API_URL=${LLM_API_URL:-http://192.168.0.121:8000/chat/completions} LLM_MODEL=${LLM_MODEL:-dummy} LLM_MAX_TOKENS=${LLM_MAX_TOKENS:-2048} LLM_DISABLE_THINKING=${LLM_DISABLE_THINKING:-1} nohup .venv/bin/python LLM/llm_service.py > /tmp/jarvis_llm.log 2>&1 &
 LLM_PID=$!
 disown $LLM_PID
 sleep 2

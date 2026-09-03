@@ -165,6 +165,13 @@
         let previousTurnId = 0;
         let lastAudioCompleteSeq = -1;
         let turnSeqStart = {};
+        // Sticky dead-turn guard: the turn_id whose audio must be
+        // dropped. Set on local barge-in (user started speaking), a
+        // server interrupt, an interrupted audio_complete, and WS
+        // disconnect; cleared when a new turn starts or a fresh
+        // connection opens. Keeps late/queued audio from a stopped turn
+        // from ever reaching the speakers.
+        let interruptedTurnId = null;
 
         // WebSocket connections
         const origin = window.location.origin.replace(/^http/, 'ws');
@@ -776,6 +783,10 @@
 
             ws.onopen = () => {
                 console.log('VAD WebSocket connected');
+                // Fresh connection (possibly a restarted server with a
+                // fresh turn counter): a stale dead-turn guard from a
+                // previous connection must not shadow new turn ids.
+                interruptedTurnId = null;
                 const dot = document.getElementById('dot-websocket');
                 if (dot) {
                     dot.className = 'service-dot idle';
@@ -833,6 +844,10 @@
                           break;
 
                     case 'llm_audio':
+                        if (interruptedTurnId && data.turn_id !== undefined && data.turn_id === interruptedTurnId) {
+                            console.log('[AUDIO] Dropping llm_audio for interrupted turn', data.turn_id);
+                            break;
+                        }
                         console.log('[AUDIO] Received llm_audio:', {
                             turn_id: data.turn_id,
                             audio_seq: data.audio_seq,
@@ -848,7 +863,16 @@
                         if (data.turn_id !== undefined) {
                             if (data.turn_id !== currentTurnId) {
                                 console.log('[AUDIO] Turn switch detected:', { oldTurnId: currentTurnId, newTurnId: data.turn_id });
+                                // A new turn is starting: anything still
+                                // queued from the previous turn is stale
+                                // and must not play over the new response.
+                                if (audioSource) {
+                                    try { audioSource.stop(); } catch(e) {}
+                                    audioSource = null;
+                                }
                                 clearPendingAudioBuffers();
+                                audioQueue = [];
+                                isPlaying = false;
                                 previousTurnId = currentTurnId;
                             }
                             currentTurnId = data.turn_id;
@@ -864,6 +888,17 @@
 
                     case 'user_start':
                         userStatus.textContent = 'Listening...';
+                        // Local barge-in: the user started speaking while
+                        // assistant audio is playing or queued. Stop it
+                        // immediately - do not wait for the server's
+                        // interrupt round-trip, and never let queued
+                        // audio play over the user's voice.
+                        if (isPlaying || audioQueue.length > 0 || pendingAudioBuffers.length > 0) {
+                            console.log('[WS] Barge-in (local): user started speaking, stopping TTS audio (turn', currentTurnId, ', prev', previousTurnId + ')');
+                            interruptedTurnId = currentTurnId || previousTurnId;
+                            stopPlayback();
+                            isLLMResponding = false;
+                        }
                         userMessageCount = 0;
                         llmMessageCount = 0;
                         currentPartialText = '';
@@ -880,6 +915,9 @@
                           currentTurnId = data.turn_id || 0;
                           previousTurnId = 0;
                           turnSeqStart[currentTurnId] = expectedNextSeq;
+                          // A new turn starts: the previous turn is dead;
+                          // stop dropping (now-stale) audio for it.
+                          interruptedTurnId = null;
                           clearPendingAudioBuffers();
                           // Only remove the currently streaming message (activeLlmMessageId != null means still generating)
                           // If activeLlmMessageId is null, the previous turn's message is already finalized and stays in DOM
@@ -942,6 +980,10 @@
                         break;
 
                     case 'interrupt':
+                        // Remember the dead turn first: stopPlayback()
+                        // below zeroes the turn ids, and late audio for
+                        // this turn must still be droppable afterwards.
+                        interruptedTurnId = currentTurnId || previousTurnId;
                         stopPlayback();
                         currentPartialText = '';
                         isLLMResponding = false;
@@ -951,7 +993,14 @@
                         break;
 
                     case 'audio_complete':
-                        console.log('[AUDIO] audio_complete received:', { turn_id: data.turn_id, lastAudioCompleteSeq });
+                        console.log('[AUDIO] audio_complete received:', { turn_id: data.turn_id, interrupted: data.interrupted, final: data.final, lastAudioCompleteSeq });
+                        if (data.interrupted) {
+                            // Server-confirmed barge-in/stop: make sure
+                            // no audio from the killed turn keeps playing.
+                            interruptedTurnId = data.turn_id || interruptedTurnId;
+                            stopPlayback();
+                            isLLMResponding = false;
+                        }
                         if (data.turn_id) {
                             previousTurnId = data.turn_id;
                         }
@@ -973,6 +1022,25 @@
                                 dot.classList.add('idle');
                             } else {
                                 dot.classList.add('offline');
+                            }
+                        }
+                        // If the LLM goes offline while a turn is in flight
+                        // (label still reads "Thinking..."), the user's
+                        // question is stuck: say so explicitly instead of
+                        // leaving "Thinking..." spinning forever. The server
+                        // re-sends the pending question on LLM reconnect.
+                        // Gated on the label itself so an idle LLM blip
+                        // never flips "Idle".
+                        if (svc === 'llm') {
+                            if (svcStatus === 'offline'
+                                    && llmStatus.textContent === 'Thinking...') {
+                                llmStatus.textContent = 'LLM offline - retrying...';
+                            } else if (svcStatus !== 'offline'
+                                    && llmStatus.textContent === 'LLM offline - retrying...') {
+                                // LLM back: the re-sent question is in flight
+                                // again; the incoming llm_start/llm_end finish
+                                // the row.
+                                llmStatus.textContent = 'Thinking...';
                             }
                         }
                         if (serviceLastHeartbeat[svc] !== undefined) {
@@ -1016,6 +1084,15 @@
 
             ws.onclose = () => {
                 console.log('VAD WebSocket disconnected, reconnecting...');
+                // The server may have been shut down (e.g. Ctrl+C): stop
+                // all playback immediately and mark the in-flight turn
+                // dead so audio still queued can never reach the speakers.
+                const deadTurn = currentTurnId || previousTurnId;
+                if (deadTurn) {
+                    interruptedTurnId = deadTurn;
+                }
+                stopPlayback();
+                isLLMResponding = false;
                 userStatus.textContent = 'Reconnecting...';
                 const dot = document.getElementById('dot-websocket');
                 if (dot) {
@@ -1057,6 +1134,7 @@
                 llmStatus.textContent = 'Waiting';
 
                 stopAudioCapture();
+                interruptedTurnId = currentTurnId || previousTurnId;
                 stopPlayback();
 
                 if (ws && ws.readyState === WebSocket.OPEN) {

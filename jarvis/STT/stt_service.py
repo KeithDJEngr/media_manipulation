@@ -332,14 +332,15 @@ async def handle_stt(websocket, stt_service):
                                     "command": wake_word,
                                 }))
                             # Send final transcript to LLM
-                            if not stt_service.is_muted:
-                                await websocket.send(json.dumps({
-                                    "type": "final_transcript",
-                                    "text": text,
-                                    "final": True,
-                                    "chunk_id": chunk_id,
-                                }))
-                                logger.info(f"STT sent final_transcript to server")
+                            else:
+                                if not stt_service.is_muted:
+                                    await websocket.send(json.dumps({
+                                        "type": "final_transcript",
+                                        "text": text,
+                                        "final": True,
+                                        "chunk_id": chunk_id,
+                                    }))
+                                    logger.info(f"STT sent final_transcript to server")
                         elif not stt_service.is_muted:
                             # Send empty final transcript even with small/no buffer so LLM gets signal
                             logger.info(f"STT sent empty final_transcript on end_of_speech (buffer: {len(stt_service.audio_buffer)} samples)")

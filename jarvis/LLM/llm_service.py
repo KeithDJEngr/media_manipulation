@@ -33,10 +33,17 @@ logger = logging.getLogger(__name__)
 #LLM_MODEL = os.getenv("LLM_MODEL", "dummy")
 
 # Basic setup
-LLM_API_URL = os.getenv("LLM_API_URL", "http://192.168.0.121:8000/chat/completions")
+LLM_API_URL = os.getenv("LLM_API_URL", "http://192.168.0.118:8000/chat/completions")
 LLM_MODEL = os.getenv("LLM_MODEL", "Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf")
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.7"))
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1024"))
+# Qwen3's thinking mode consumes the max_tokens budget in reasoning_content BEFORE
+# any content token is emitted, so a 1024 budget exhausted entirely in thinking and
+# returned an empty (silent) reply with finish_reason="length". 2048 leaves headroom
+# for a full spoken answer with thinking disabled.
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2048"))
+# Disable Qwen3 thinking mode by default (see above). Set to 0 to re-enable thinking
+# (in which case also raise LLM_MAX_TOKENS, e.g. 4096, or the budget runs out in thinking).
+LLM_DISABLE_THINKING = os.getenv("LLM_DISABLE_THINKING", "1") != "0"
 
 use_full_history=True
 
@@ -67,6 +74,44 @@ async def handle_llm(websocket, llm_info):
 
     heartbeat_task = asyncio.create_task(send_heartbeats())
 
+    # Incoming messages are consumed by a dedicated pump task instead of this
+    # loop reading the websocket directly. While a turn is generating, this
+    # loop is blocked inside the LLM API stream and cannot see incoming
+    # messages; the pump observes a "stop" the moment it arrives and flips
+    # continue_generating immediately, so a barge-in (user interrupt / Stop
+    # button) kills the in-flight stream at the next token boundary instead of
+    # letting the whole response finish and leak into TTS. A None sentinel
+    # means the pump saw the websocket close (or error) and ends this loop.
+    close_reason = None
+    incoming_queue = asyncio.Queue()
+
+    async def pump_messages():
+        """Read the websocket and enqueue parsed messages for the main loop."""
+        nonlocal close_reason
+        global continue_generating
+        try:
+            async for raw in websocket:
+                try:
+                    msg = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    logger.error(f"LLM-SERVICE: invalid JSON from server: {str(raw)[:100]}")
+                    continue
+                if isinstance(msg, dict) and msg.get("type") == "stop" and continue_generating:
+                    # Barge-in: flip immediately without waiting for the main
+                    # loop, which may be blocked for the whole turn. The main
+                    # loop's own stop branch (idempotent) handles dispatch.
+                    logger.info("LLM-SERVICE: stop received - interrupting in-flight generation")
+                    continue_generating = False
+                await incoming_queue.put(msg)
+        except websockets.ConnectionClosed as e:
+            close_reason = getattr(e, "reason", None) or str(e)
+        except Exception as e:
+            logger.error(f"LLM-SERVICE: pump error: {e}")
+        finally:
+            await incoming_queue.put(None)
+
+    pump_task = asyncio.create_task(pump_messages())
+
     global continue_generating
     try:
         # Signal ready immediately
@@ -78,20 +123,20 @@ async def handle_llm(websocket, llm_info):
         }))
         logger.info("LLM service ready")
 
-        # Process incoming messages
-        async for message in websocket:
+        # Process incoming messages (parsed dicts from the pump task;
+        # a None sentinel means the pump saw the websocket close or error)
+        while True:
             try:
-                if isinstance(message, bytes):
-                    msg = json.loads(message)
-                else:
-                    msg = json.loads(message)
+                msg = await incoming_queue.get()
+                if msg is None:
+                    break
 
                 msg_type = msg.get("type")
 
                 if msg_type == "set_system_prompt":
                     new_prompt = msg.get("prompt", "")
                     if new_prompt:
-                        pre_history = {"role": "system", "content": new_prompt}
+                        pre_history = [{"role": "system", "content": new_prompt}]
                         logger.info(f"System prompt updated to: {new_prompt[:80]}...")
                     continue
 
@@ -123,7 +168,7 @@ async def handle_llm(websocket, llm_info):
                     # Accept history from server if provided
                     if "history" in msg:
                         new_history = msg["history"]
-                        logger.info(f"LLM-SERVICE - got new history from server: {new_history[1:]}")
+                        logger.debug(f"LLM-SERVICE - got new history from server: {new_history[1:]}")
                         # Keep system prompt, replace rest
                         if len(new_history) > 0 and new_history[0].get("role") == "system":
                             conversation_history[:] = pre_history + new_history[1:]
@@ -136,7 +181,7 @@ async def handle_llm(websocket, llm_info):
                     if is_partial:
                         continue
 
-                    logger.info(f"LLM-SERVICE >>> conversation_history for LLM: {json.dumps(conversation_history, ensure_ascii=False, indent=2)}")
+                    logger.debug(f"LLM-SERVICE >>> conversation_history for LLM: {json.dumps(conversation_history, ensure_ascii=False, indent=2)}")
                     
                     # Send start signal
                     logger.info(f"LLM-SERVICE: sending llm_start (user_text='{user_text[:80]}...')")
@@ -171,6 +216,16 @@ async def handle_llm(websocket, llm_info):
                         "temperature": llm_info.get('temperature', LLM_TEMPERATURE),
                         "max_tokens": llm_info.get('max_tokens', LLM_MAX_TOKENS),
                     }
+                    if LLM_DISABLE_THINKING:
+                        # Qwen3's llama.cpp server ignores the OpenAI-style "thinking" key
+                        # (verified: reasoning_content still streams with it set) but honors
+                        # the chat-template flag. Without enable_thinking=false the model
+                        # spends the entire max_tokens budget in reasoning_content and
+                        # returns an empty reply with finish_reason="length" -> silence.
+                        # Both keys are sent: "thinking" for OpenAI-compatible backends
+                        # that honor it, chat_template_kwargs for llama.cpp's Qwen3 template.
+                        payload["thinking"] = {"type": "disabled"}
+                        payload["chat_template_kwargs"] = {"enable_thinking": False}
 
                     continue_generating=True
                     try:
@@ -178,21 +233,36 @@ async def handle_llm(websocket, llm_info):
                         llm_msg=""
 
                         # Use AsyncClient with a timeout (handles connect, read, and write delays)
-                        async with httpx.AsyncClient(timeout=240) as client:
+                        # 30s is the *between-reads* limit on the stream: a stalled
+                        # upstream API is caught quickly and the existing error path
+                        # below sends the spoken fallback + llm_end, so the user's
+                        # turn resolves instead of hanging for 4 minutes.
+                        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as client:
 
                             # CRITICAL CHANGE: Use .stream("POST", ...) instead of .post()
                             # This forces httpx to handle the response as a stream immediately.
                             token_count = 0
+                            reasoning_chars = 0
+                            finish_reason = None
+                            interrupted = False
                             async with client.stream("POST", llm_info['api_url'], json=payload) as response:
                                 if response.status_code != 200:
-                                    logger.info(f"Error: {response.status_code}")
+                                    logger.error(f"LLM API error: {response.status_code}")
                                     break
 
                                 logger.info("Receiving Stream:\n")
 
-                                # aiter_lines is the non-blocking equivalent of requests' iter_lines
+                                # Read all data at once to avoid aiter_lines() dropping the last line(s)
+                                # when the server closes the connection before fully flushing its buffer
+
+                                #raw_data = await response.aread()
+                                #text_data = raw_data.decode("utf-8", errors="replace")
+                                #lines = text_data.split("\n")
+
+                                #for line in lines:
                                 async for line in response.aiter_lines():
                                     if not continue_generating:
+                                        interrupted = True
                                         continue_generating=True
                                         break
                                     if not line:
@@ -203,22 +273,39 @@ async def handle_llm(websocket, llm_info):
                                         data = line.strip()
                                         if data.startswith("data:"):
                                             data = data[5:].strip()
+                                        if not data:
+                                            continue
+                                        if data == "[DONE]":
+                                            # OpenAI-style end-of-stream sentinel (llama.cpp sends it too);
+                                            # not JSON, so it must be handled before json.loads
+                                            break
 
                                         json_data = json.loads(data)
 
                                         choices = json_data.get('choices', [])
                                         if choices:
-                                            delta = choices[0].get('delta', {})
+                                            choice = choices[0]
+                                            delta = choice.get('delta', {})
+                                            fr = choice.get('finish_reason')
+                                            if fr:
+                                                finish_reason = fr
 
-                                            # Support standard content or reasoning tags (common in newer models)
-                                            # enable to disable thinking
-                                            token = delta.get('content', '')# or delta.get('reasoning_content', '')
+                                            # reasoning_content is the model's internal "thinking" (Qwen3).
+                                            # Count it for diagnostics only - never stream it to the
+                                            # client/TTS, it is not conversational text.
+                                            reasoning = delta.get('reasoning_content') or ''
+                                            if reasoning:
+                                                reasoning_chars += len(reasoning)
+                                                logger.debug(f"reasoning: {reasoning[:60]}")
+
+                                            # delta.get('content') is None on the first chunk;
+                                            # 'or' normalizes it to '' so it is skipped cleanly
+                                            token = delta.get('content') or ''
 
                                             if token:
                                                 llm_msg+=token
                                                 token_count += 1
-                                                if token_count <= 3 or token_count % 20 == 0:
-                                                    logger.info(f"LLM-SERVICE: token #{token_count}: '{token}' (accumulated so far: '{llm_msg[:80]}...')")
+                                                logger.debug(f"content: {token}")
                                                 try:
                                                     await websocket.send(json.dumps({"type": "llm_token", "text": token, "partial": True}))
                                                 except websockets.ConnectionClosed:
@@ -228,12 +315,29 @@ async def handle_llm(websocket, llm_info):
                                     except json.JSONDecodeError:
                                         continue
 
-                                logger.info(f"\n\nDone. Total tokens streamed: {token_count}")
+                                # Post-stream diagnostics: finish_reason="length" means the
+                                # max_tokens budget ran out. With zero content tokens the whole
+                                # budget was spent on thinking (Qwen3) and the user got silence.
+                                if response.status_code == 200:
+                                    if finish_reason == "length":
+                                        if token_count == 0:
+                                            logger.error(
+                                                f"LLM produced NO content: max_tokens budget exhausted entirely "
+                                                f"in reasoning_content ({reasoning_chars} chars, finish_reason='length'). "
+                                                f"Set LLM_DISABLE_THINKING=1 (default) or raise LLM_MAX_TOKENS."
+                                            )
+                                        else:
+                                            logger.warning(
+                                                f"LLM response TRUNCATED at max_tokens "
+                                                f"({token_count} content tokens, {reasoning_chars} reasoning chars, finish_reason='length')"
+                                            )
+                                    else:
+                                        logger.info(f"Done. finish_reason={finish_reason}, content tokens={token_count}, reasoning chars={reasoning_chars}")
 
                     except httpx.ConnectError:
-                        logger.info("Could not connect. Make sure Ollama is running or check IP address.")
+                        logger.error("Could not connect. Make sure the LLM server (llama-server) is running or check IP address.")
                     except Exception as e:
-                        logger.info(f"An error occurred: {e}")
+                        logger.error(f"An error occurred: {e}")
 
 
                     # TODO: clear when it's validated this works without
@@ -243,21 +347,49 @@ async def handle_llm(websocket, llm_info):
                     #if len(conversation_history) > 21:
                     #    conversation_history = conversation_history[-19:]
 
+                    # The model produced nothing: budget exhausted in thinking mode, an empty
+                    # completion, or an API/connection failure. Never leave the user in
+                    # silence - speak a fallback so the turn is audible, and it stays in the
+                    # conversation history as context for the next turn.
+                    if not llm_msg.strip() and not interrupted:
+                        logger.error("LLM generated empty content - sending spoken fallback instead of silence")
+                        llm_msg = "Sorry, I couldn't generate an answer to that. Could you say it again, please?"
+                        try:
+                            await websocket.send(json.dumps({"type": "llm_token", "text": llm_msg, "partial": True}))
+                        except websockets.ConnectionClosed:
+                            logger.info("WebSocket closed while sending fallback message")
+
                     # Send end signal with accumulated text
                     logger.info(f"LLM-SERVICE: sending llm_end (total_text_len={len(llm_msg)}, text='{llm_msg[:100]}...')")
                     try:
                         await websocket.send(json.dumps({
                             "type": "llm_end",
                             "text": llm_msg,
+                            "interrupted": interrupted,
                         }))
                     except websockets.ConnectionClosed:
                         logger.info("WebSocket closed before sending llm_end")
 
-            except json.JSONDecodeError as e:
-                logger.error(f"Invalid JSON from server: {e}")
             except Exception as e:
                 logger.error(f"LLM processing error: {e}")
                 raise
+        # The pump terminates when the websocket closes; mirror the close
+        # logging (and best-effort status) the old inline async-for path used
+        # to produce here. The except handlers below still cover failures that
+        # surface during a send.
+        if close_reason is not None:
+            if "1011" in close_reason or "keepalive" in close_reason.lower():
+                logger.info(f"LLM connection closed (ping timeout): {close_reason}")
+            else:
+                logger.info(f"LLM connection closed: {close_reason}")
+            try:
+                await websocket.send(json.dumps({
+                    "type": "service_status",
+                    "service": "llm",
+                    "status": "disconnected",
+                }))
+            except Exception:
+                pass
 
     except websockets.ConnectionClosed as e:
         reason = getattr(e, 'reason', str(e)) if hasattr(e, 'reason') else str(e)
@@ -287,9 +419,14 @@ async def handle_llm(websocket, llm_info):
             pass
     finally:
         heartbeat_task.cancel()
+        pump_task.cancel()
         try:
             await heartbeat_task
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, Exception):
+            pass
+        try:
+            await pump_task
+        except (asyncio.CancelledError, Exception):
             pass
 
 async def main():

@@ -1,36 +1,74 @@
 # Current state
 The webpage works. It has a transcript with user messages and LLM responses.
+Streaming TTS: audio for each sentence starts while the LLM is still generating.
+Interrupt: barge-in (user speech starting during an active turn) AND the on-screen stop
+button now kill the in-flight turn end-to-end: the server sends "stop" to BOTH the LLM and
+the TTS services. Previously the stop-button path only cleared the server's own
+service_active flags and never told TTS to stop, so TTS kept generating until its own
+queue drained and sent audio_end (interrupted:false) - and the browser keys its "speaking"
+UI state off the audio_end broadcast, so it stayed stuck "speaking" indefinitely after the
+button press. Every interrupted turn now produces exactly one llm_end (interrupted:true)
+and one audio_end (interrupted:true) broadcast, so the client's state machine always
+resolves; the interrupted turn's user message is also dropped from history so the model
+never sees a dangling, unanswered question on the next turn. A second, latent failure was
+closed: a duplicate/stale service connecting to an already-occupied endpoint (a stray
+start.sh) used to silently replace the live registration and later a stale "disconnected"
+event could null the NEW registration. Now registration logs "duplicate service suspected
+(replacing live connection)" for detection, and unregistration only clears a reference
+that actually points at the disconnecting socket; the heartbeat watchdog warns about
+silence but no longer nulls a live registration.
 
-# Current tasks
-- [ ] Fix and LLM stop handling - on user pushing the stop button it should send a message to the LLM and the TTS to cancel their current requests and clear queues.
-- [ ] Create a new test script that makes requests of the same LLM as you can see in the logs in /tmp. Test it many times and evalute its speed and ensure it's streaming not just sending the response at the end.
-- [ ] Make TTS take LLM in batches (accepting whatever pieces it would generate itself [e.g. sentences])
+The earlier "kill the in-flight turn" fix still left a hole: barge-in only
+worked on the first one or two requests. TTS signals the end of EVERY
+sentence with its own audio_end, and the server cleared its "assistant is
+speaking" flag on each of those - so from the first sentence boundary on,
+the barge-in gate believed nothing was playing and ignored user speech for
+the rest of the response. The flag now stays set until the turn-final
+audio_end (or an interrupt); a late llm_end for an already-ended turn can
+no longer resurrect a phantom speaking state (the tts flag is only
+re-armed when the TTS pipe is connected and the turn has no final end);
+and the browser additionally stops playback locally the instant the user
+starts speaking, drops late audio for a killed turn, and silences itself
+immediately when the server connection drops (Ctrl+C) - queued audio can
+no longer keep playing.
 
 # Completed tasks
 
-## Need to verify complete
-
+- [x] Fix "audio stop only worked on the first two requests". Root cause from the 07:57 session logs: TTS sends an audio_end per sentence (one per input message) and handle_tts cleared the "assistant is speaking" flag on EVERY one - so the flag was off again 130 ms after llm_end (at the first sentence boundary) and the barge-in gate (Server/jarvis_server.py:678-680: tts or llm or pending_turns) saw no active turn, ignoring user speech for the rest of the response; turns 1-2 only worked by timing luck. Three-part fix: (1) TTS marks the turn-final end - per-input audio_end carries "final": not partial (a partial=False input only arrives at llm_end) and the stop path sends final:true (TTS/tts_service.py:796-801, 854-859); (2) server clears the tts flag only on a final or interrupted end, records last_tts_final_turn, and re-arms tts on llm_end only when the TTS pipe is connected and the turn has no final end yet (a late llm_end can no longer resurrect a phantom "speaking" state after a TTS disconnect mid-turn - unregister_tts marks that turn final; Server/jarvis_server.py:156-161, 253-258, 919-928) and forwards final/interrupted in the audio_complete broadcast (1040-1059); the barge-in gate itself is unchanged - it now simply works because the flag stays set for the whole audio stream; (3) client (ProjectInterface/index.html): sticky interruptedTurnId dead-turn guard - user_start now stops in-flight and queued audio locally the moment the user starts speaking (no server round-trip), late llm_audio for a killed turn is dropped, turn switches flush audioQueue (not only pendingAudioBuffers), and ws.onclose (e.g. server Ctrl+C) stops playback, marks the in-flight turn dead, and the guard clears on the next llm_start/reconnect; the Stop button also arms the guard. Verified by probe_barge_in.py: 11/11 PASS, 0 FAIL (Phase A 4 checks: barge-in during LLM stream; Phase B 3 checks: next turn healthy, model recalls the last real question, killed question absent; Phase C 4 checks: barge-in ~2 s AFTER the first per-sentence audio_end, i.e. exactly inside the old dead window - TTS silenced, audio_complete {turn_id:4, interrupted:true, final:true}, 0 stray audio chunks and 0 stray non-interrupted ends in the 3 s follow-up window). Stack: single wrapper PID 3534708 (launched 08:58:09, still the harness bg_1 job, all 5 processes alive since launch), port 0.0.0.0:8765, LLM pinned to 192.168.0.118:8000 - the user's env var points at dead port 8001, so relaunch with the :8000 URL (or use the start.sh default).
+- [x] Fix LLM not receiving streaming tokens - API sends reasoning_content, code now checks both content and reasoning_content (LLM/llm_service.py:215)
+- [x] Create test script for chat/completions (LLM/test_streaming.py) - validates streaming, speed, token count
+- [x] Fix TTS and LLM stop handling - stop button sends 'interrupt' to TTS/LLM, both handle cancellation
+- [x] Make LLM send batches to the TTS - server forwards partial tokens to TTS (Server/jarvis_server.py:747-751), TTS accumulates and processes incrementally (TTS/tts_service.py:129-176)
 - [x] Add reset_history message handling in LLM service (LLM/llm_service.py)
 - [x] Enable reset_history in server (Server/jarvis_server.py:423-424)
-- [x] Desync mute button and "mute now" command - "mute now" only updates visual, doesn't mute mic (ProjectInterface/index.html:999-1004)
-- [x] Clean up KokoroTTSProcessor dead code (removed unused text_buffer, current_chunk_text, processed_words)
+- [x] Desync mute button and "mute now" command (ProjectInterface/index.html:999-1004)
+- [x] Clean up KokoroTTSProcessor dead code
 - [x] Fix KokoroTTSProcessor tensor handling - .cpu().numpy() before .astype() (TTS/tts_service.py:344)
 - [x] Fix KokoroTTSProcessor resampling from 24kHz to 16kHz (TTS/tts_service.py:347-350)
 - [x] Fix KokoroTTSProcessor chunking yield placement inside inner loop (TTS/tts_service.py:361-366)
+- [x] Fix silent LLM turns: Qwen3 thinking mode exhausted max_tokens in reasoning_content (1024 thinking tokens, 0 content, finish_reason=length) - disabled thinking via chat_template_kwargs, raised default LLM_MAX_TOKENS to 2048, added spoken fallback on empty completion, finish_reason/[DONE] handling, and ignore empty STT transcripts in history (LLM/llm_service.py, Server/jarvis_server.py)
+- [x] Stream LLM output to TTS per sentence: server forwards to TTS as soon as a sentence boundary (or 150 chars) is crossed since the last forward; TTS accumulates and speaks incrementally instead of waiting for the full response (Server/jarvis_server.py SENTENCE_BOUNDARY_RE / llm_token relay, TTS/tts_service.py)
+- [x] Interrupt (barge-in) end-to-end: LLM pump task flips generation off the moment a "stop" arrives (LLM/llm_service.py), sends exactly one llm_end with interrupted:true; server tracks forwarded finals in pending_turns (FIFO) + active turn, and on an interrupted (or pipe-dropped) turn drops that turn's user message from the conversation history by content match - content-matched (not "drop last") because the next utterance's STT partial can land in the history before the interrupt's llm_end arrives; interrupted turns also skip the assistant-history and TTS-final write (Server/jarvis_server.py: pending_turns/active_turn_*, drop_usr_msg, llm_end relay, unregister_llm, reset)
+- [x] Regression tests for interrupt bookkeeping: completed turn keeps user+assistant; interrupted turn drops the user message, adds no partial assistant message, clears bookkeeping; LLM pipe drop mid-turn drops the in-flight user message (tests/test_server_integration.py)
+- [x] E2E barge-in probe on the live stack ("killed turn stays silent"): injected a long dragon-story final via a fake STT and interrupted once TTS audio was already in flight -> llm_end interrupted:true, zero llm_transcript/llm_audio in the 3s post-llm_end window, audio_complete interrupted:true; on the follow-up turns the model answered "The capital of France is Paris." and, when asked to quote the immediately previous question verbatim, it quoted the France question - not the killed dragon question. Log evidence: server "Turn 1 was interrupted - removed its user message from history", LLM "stop received - interrupting in-flight generation", TTS "TTS generation stopped (interrupt)". Probe: /home/razor/git/media_manipulation/tmp/probe_barge_in.py (ran ./stop.sh + ./start.sh before and after)
+- [x] Fix "still plays sound after I talk" (server side): handle_vad_service only branched on vad_result when speech == False - a VAD speech START was silently dropped, so no user barge-in could ever reach the interrupt pipeline (client interrupt -> TTS/LLM stop); the stop button was the only trigger left. New speech == True branch (Server/jarvis_server.py:654-670): when service_active["tts"] or service_active["llm"] or pending_turns, it broadcasts {"type":"interrupt"} to the client and sends "stop" to TTS and to the LLM service - the exact message sequence of the stop-button path; the existing client interrupt branch is untouched. Before/after log evidence: the 03:19 session had 16 VAD "Detected start of speech" lines around active turns and ZERO server interrupt actions; with the branch in place the new regression tests fire the full interrupt path.
+- [x] Regression tests for the barge-in trigger (tests/test_server_integration.py): (1) with an active turn (pending_turns + service_active llm/tts set) a vad_result speech==True message -> client receives {"type":"interrupt"} and TTS and LLM each receive {"type":"stop"}; (2) same message while the assistant is idle -> nothing is sent. Run under the project .venv (system python3.14 lacks pytest-asyncio/torch): 24 passed, 2 failed = the known pre-existing truncate pair (baseline was 22 passed / 2 failed) -> zero regressions.
+- [x] Fix stop.sh no-op + collateral-kill bug: positional args [host] [port] were ignored (HOST/PORT only read from env vars, which are unset in practice) -> `./stop.sh 0.0.0.0 8765` printed `Server: http://:` and killed nothing (demonstrated live - the running stack was left untouched). It now parses $1/$2 with env-var fallback, mirroring start.sh (stop.sh:10-12); the kill pattern was also tightened to `python|pip ... {jarvis_server|vad_service|stt_service|llm_service|tts_service}.py` so editors and log watchers whose command lines merely mention those names are no longer killed (the old bare-name grep had taken out the user's vim and two log-watch windows).
+- [x] Clear the double-service-stack incident: a 03:13:57 `./start.sh` (no args) stacked a second VAD/STT/LLM/TTS on top of the canonical 02:43 stack (server 3207326 on 127.0.0.1). The second start.sh's own server died on port 8765 (EADDRINUSE), but its four services connected to the canonical server's 0.0.0.0 bind and silently REPLACED the old service registrations - user audio was flowing through the new services while the old ones sat alive but stale. Resolved: killed all four start.sh scripts + nine service processes by explicit PID (user's vim/watch untouched), verified :8765 free, then one clean `start.sh 0.0.0.0 8765` -> all four readiness lines (LLM/VAD/STT/TTS) on a single stack running the barge-in fix.
+- [x] AEC investigation: browser mic captures with echoCancellation:true; a VAD-log census of the 03:19 session (10,131 "VAD processed" lines at ~10/sec) shows ZERO speech-start events inside any of the six TTS playback windows - all 9 starts land 4-6 s AFTER the nearest playback end, matching the user's testimony that the "what time is it in Tokyo" question (final at 03:19:47) was swallowed during Jarvis's playback. The mic stream therefore likely does not contain the user's voice while TTS plays, so the new server-side trigger can only fire if the voice reaches the VAD. A controlled user test (speak over a long response after this deploy) decides whether a client-side AEC toggle is also required. A blind client AEC-off toggle is unsafe: with the trigger firing on any speech start, Jarvis's own playback would cause a self-interrupt loop - if the test proves swallowing, the toggle needs an echo-discrimination guard.
+- [x] Fix "still playing audio after I press stop" (server side): the client-interrupt branch only cleared service_active flags and removed the turn, but never sent "stop" to the TTS service - TTS kept generating to the end of its queue and its natural audio_end (interrupted:false) re-armed the client's speaking state, which is exactly what the browser UI listens on. The branch now sends {"type":"stop"} to TTS and LLM, identical to the barge-in path (Server/jarvis_server.py:933-938), with "Client interrupt: stop sent to TTS/LLM" log lines for verification. Proven with a live fake-TTS/fake-LLM/fake-browser probe (jarvis/tmp/probe_interrupts.py): the fakes each received the stop, llm_end arrived interrupted:true, and the server broadcast audio_end interrupted:true (the client's authoritative clear signal) - 18/18 checks PASS across barge-in and stop-button scenarios on the live 06:43 stack.
+- [x] Duplicate-service detection + crash-safe registration: register_* now logs "WARNING - <svc> service re-registered: replacing live connection (state=OPEN) - duplicate service suspected" when a new connection displaces a live one (Server/jarvis_server.py:126-130, 202-206) - fired correctly on the 06:23 incident where a dead probe's sockets displaced the live services; unregister_* now clears a reference only when it still points at the disconnecting websocket (guard: `if self.<x>_ws is websocket and state != OPEN`), so a stale disconnect from an old socket can no longer null the NEW service's registration (jarvis_server.py:320-377); per-service heartbeat tasks are cancelled on disconnect and the heartbeat watchdog is log-only (warns on silence, never nulls a live reference) - a service that is alive but momentarily quiet keeps its registration.
+- [x] Live-stack verification: the 06:43 stack (server 3430235) ran the fixed build - all four services + the user's browser re-registered cleanly, zero re-registration warnings, and the full interrupt probe passed 18/18 (barge-in and stop-button: stops reached both fake services, interrupted llm_end + audio_end broadcast, no ConnectionClosed warnings, no stale-nulling). Two stale start.sh wrappers left by earlier sessions (04:26 and 06:00 stacks) were found still running and killed - stop.sh never matched them (it only kills service .py processes), which is how they accumulated.
+- [x] Operational lesson - never launch the start.sh wrapper with a command timeout: at 06:47:53 the 06:43 stack died because its background wrapper had a 300s timeout - the harness kills the job's ENTIRE process group on timeout, and services started via `nohup ... & disown` inside a non-interactive script share the wrapper's process group (disown only removes them from the shell's job table; nohup only ignores SIGHUP), so the group-kill took all five down with it. The trap-based cleanup never even ran (SIGKILL). Recovery: relaunch with timeout 0 - the 06:49 stack (server 3435752, wrapper 3435737, no timeout) is the current one; prior-session wrappers without a timeout have been shown to survive session boundaries. User-facing semantics are unaffected: in the user's own terminal, Ctrl+C on start.sh still cleanly stops everything via the trap, and ./stop.sh works as before.
 
-# Future tasks
+# Remaining tasks
 
-## General
-- [ ] LLM is sometimes not receiving streaming tokens. It works for some requests but others return 0 or 1 token. I see the LLM receiving the request and generating tokens but Is it sending the wrong request maybe? Or is there something about what it sends that would change it from streaming or how it's streaming? The latest run is an example of this and you can see the results in /tmp. See if you can find what's wrong and fix it.
 - [ ] Make ordering TTS work for multiple message handling.
+- [ ] STT partials don't have the history so they're not really good for anything except keeping track that I'm listening.
+- [ ] Controlled AEC test + decision: if the tab ever shows disconnected, hard-refresh it (normally the browser auto-reconnects to a restarted server - it did at both 06:43 and 06:49). Then the user speaks over a long TTS response mid-playback; check /tmp/jarvis_vad.log for a "Detected start of speech" INSIDE a playback window and /tmp/jarvis_server.log for "Barge-in: user speech started during active turn - interrupting". If a start fires -> the server-side trigger alone resolves the complaint. If the voice is still swallowed -> add the client-side AEC toggle with a self-interrupt/echo-discrimination guard (or advise on hardware/positioning).
+- [ ] User browser verification of the audio-stop fix: (a) speak over a long response from the 3rd request onward - playback must cut almost immediately (server log: "Barge-in: user speech started during active turn - interrupting"); (b) Ctrl+C the start.sh wrapper while audio is playing - the browser must go silent immediately (previously it kept playing the whole queue through the reconnect). If the tab ever shows disconnected, hard-refresh it (the client JS now ships per-connection, so a normal reload picks it up).
 
-## New features
-
-## General
-
-## Future TODOs
-- [ ] STT parials don't have the history so they're not really good for anything except keeping track that I'm listening.
-
-# I believe resolved
-
-## General
+# Known pre-existing test issues (fail on clean HEAD d00a533, unrelated to the above)
+- tests/test_server_integration.py (2) and tests/test_connection_manager.py (3): call `manager.truncate_conversation_history(...)` / read `manager.conversation_history` - the real API is `manager.conversation_history_manager.truncate_history()`; the tests were written against a removed attribute
+- tests/test_tts_processor.py (27): error at import with `intel_extension_for_pytorch.__spec__ is not set` - oneDNN/IPEX is not installed in .venv
+- tests/test_stt_buffer.py::test_stt_transcribe_partial_returns_text: asserts a partial transcript is truncated ('Hello wo'); fails on clean HEAD

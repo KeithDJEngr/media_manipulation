@@ -13,7 +13,9 @@ Protocol (server -> client):
 
 TTS output sent to server:
   - audio_chunk: Base64-encoded float32 audio samples at 16kHz mono
-  - audio_end: Generation complete
+  - audio_end: Sent per input message (one per sentence boundary).
+    "final": true marks the turn-final end (the one that clears the
+    server's speaking state); "interrupted": true marks a barge-in stop
 """
 
 import asyncio
@@ -74,8 +76,20 @@ TTS_CHUNK_WORDS = int(os.getenv("TTS_CHUNK_WORDS", "30"))  # Process every N wor
 TTS_MAX_CHUNK_DURATION = float(os.getenv("TTS_MAX_CHUNK_DURATION", "4.0"))  # Max seconds before forcing chunk
 TTS_MIN_CHUNK_WORDS = int(os.getenv("TTS_MIN_CHUNK_WORDS", "8"))  # Minimum words before processing a chunk
 
-# Sentence boundary regex
-SENTENCE_RE = re.compile(r'[.!?]\s+|[.!?]$')
+# Sentence boundary regex. A terminal period/exclamation/question mark
+# counts as a boundary when followed by:
+#   - whitespace (the common case), or
+#   - end of text, or
+#   - a capitalized word (uppercase + lowercase) immediately preceded by
+#     two word characters — this catches no-space concatenations from
+#     streamed token joins ("end.This" -> "end." + "This") while keeping
+#     "U.S." / "U.S.has" and numbers ("3.14") intact: an abbreviation's
+#     period is preceded by a single letter or another period, so no
+#     boundary is found there.
+# Also used for flushing: a partial LLM message flushes to TTS as soon
+# as it contains a complete sentence, so audio can start without waiting
+# for the full response.
+SENTENCE_RE = re.compile(r'[.!?](?=\s|$|(?<=\w\w[.!?])[A-Z][a-z])')
 
 class TTSHandler:
     """TTS handling with chunked streaming support.
@@ -151,9 +165,13 @@ class TTSHandler:
             self.current_chunk_text += (" " if self.current_chunk_text else "") + new_text
             self.processed_words = current_words
 
-            # Check if we should process this chunk
+            # Check if we should process this chunk. The boundary check
+            # looks at the newly accumulated text, not the whole message:
+            # the server forwards the full accumulated text every time, so
+            # testing it would find the first sentence's boundary in every
+            # partial and flush on every message.
             should_process = (
-                self._has_sentence_boundary(text) or
+                self._has_sentence_boundary(self.current_chunk_text) or
                 len(self.current_chunk_text.split()) >= TTS_CHUNK_WORDS or
                 len(self.current_chunk_text) >= 150
             )
@@ -162,17 +180,31 @@ class TTSHandler:
                 chunk_to_process = self.current_chunk_text
                 self.current_chunk_text = ""
                 self.processed_words = current_words
-                yield self.tts_processor._process_chunk(chunk_to_process)
+                # Must iterate the processor: a bare
+                # `yield self.tts_processor._process_chunk(text)` hands the
+                # worker an un-iterated generator object, which its dict
+                # filter silently drops - no audio, no error. Routing
+                # through generate_audio_chunks also applies dedup and the
+                # interrupt check, as the final flush does.
+                yield from self.generate_audio_chunks(chunk_to_process)
         else:
-            # Final token - process remaining text
+            # Final message - flush any text not yet covered by a
+            # sentence-boundary partial. Only words not already processed are
+            # appended, so sentences already spoken via partials are skipped.
             current_words = len(text.split())
             new_words = current_words - self.processed_words
             if new_words > 0:
                 words = text.split()
                 self.current_chunk_text += (" " if self.current_chunk_text else "") + " ".join(words[self.processed_words:])
-                yield self.tts_processor._process_chunk(self.current_chunk_text)
             self.processed_words = 0
-            self.current_chunk_text = ""
+            if self.current_chunk_text.strip():
+                remainder = self.current_chunk_text
+                self.current_chunk_text = ""
+                # Speak the remainder sentence by sentence so audio can start
+                # immediately. Dedup is off here: the word accounting above
+                # already guarantees only unspoken text reaches this flush.
+                for sentence in self.split_into_sentences(remainder):
+                    yield from self.generate_audio_chunks(sentence, dedup=False)
 
     def _has_sentence_boundary(self, text):
         """Check if text contains a sentence boundary."""
@@ -187,7 +219,8 @@ class TTSHandler:
         self.last_generated_len = 0
         self.tts_processor.interrupt_event.clear()
         self.current_turn_id = turn_id
-        # Note: keep last_generated_text/len to avoid regenerating prefixes of previous responses
+        # Clear so a new turn is never deduplicated against the previous
+        # turn's generated prefix (e.g. "Yes." ending both turns).
 
     def interrupt(self):
         """Signal interruption (user started speaking again)."""
@@ -202,30 +235,36 @@ class TTSHandler:
         if not stripped:
             return []
 
-        # Split on sentence boundaries while preserving the delimiter
-        sentences = re.split(r'(?<=[.!?])\s+', stripped)
+        # Split on sentence boundaries: whitespace, end of text, or a
+        # capitalized word immediately preceded by two word chars follows
+        # terminal punctuation (zero-width, so delimiters are not
+        # consumed; see SENTENCE_RE).
+        sentences = re.split(r'(?<=[.!?])(?=\s|$|(?<=\w\w[.!?])[A-Z][a-z])', stripped)
 
         # Filter empty sentences
         result = [s.strip() for s in sentences if s.strip()]
         return result
 
-    def generate_audio_chunks(self, text):
+    def generate_audio_chunks(self, text, dedup=True):
         """Generator that yields audio chunks from text.
 
-        Skips redundant generation - if the same text has already been generated
-        (from a previous partial message), skips to avoid regenerating audio.
-        Also skips shorter texts that are prefixes of already-generated text,
-        since they will be replaced by the longer version anyway.
+        With dedup enabled, skips redundant generation - if the same text has
+        already been generated (from a previous partial message), it is skipped
+        to avoid regenerating audio, as are shorter texts that are prefixes of
+        already-generated text (they will be replaced by the longer version).
+        Pass dedup=False when the caller has already de-duplicated by word
+        accounting (the final flush), so every sentence is spoken.
         """
         stripped = text.strip()
         if not stripped:
             return
-        if stripped == self.last_generated_text:
-            return
-        # Skip if this text is shorter than what we've already generated
-        # and is a prefix of it (will be replaced by the longer version)
-        if len(stripped) < self.last_generated_len and self.last_generated_text.startswith(stripped):
-            return
+        if dedup:
+            if stripped == self.last_generated_text:
+                return
+            # Skip if this text is shorter than what we've already generated
+            # and is a prefix of it (will be replaced by the longer version)
+            if len(stripped) < self.last_generated_len and self.last_generated_text.startswith(stripped):
+                return
         self.last_generated_text = stripped
         self.last_generated_len = len(stripped)
 
@@ -301,9 +340,10 @@ class KokoroTTSProcessor:
     _process_chunk(self,text)
     """
 
-    def __init__(self,device="xpu",speaker="af_sarah",model_path=None,voice_instruct=None,language="en"):
+    def __init__(self,device="xpu",speaker="af_sarah",speed=1.0,model_path=None,voice_instruct=None,language="en"):
         self.interrupt_event = asyncio.Event()
         self.speaker = speaker
+        self.speed = speed
         self.model_path = model_path
         self.device = device
         self.voice_instruct = voice_instruct
@@ -314,9 +354,36 @@ class KokoroTTSProcessor:
     def _load_model(self):
         self._reload_model()
 
+    def reload_model(self):
+        # Public alias used by TTSHandler.set_speaker (and the DEVICE_LOST
+        # recovery path); re-creates the pipeline and re-warms it.
+        self._reload_model()
+
     def _reload_model(self):
-        # Initialize pipeline
+        # Initialize pipeline and pre-warm it (see _prewarm).
         self.pipeline = KPipeline(lang_code='a', device=self.device)
+        self._prewarm()
+
+    def _prewarm(self):
+        """Run one throwaway generation so the first real sentence doesn't
+        pay the XPU cold-start cost.
+
+        The first pipeline() call on a fresh process takes ~4.5 s on the
+        XPU vs ~1.7-2.3 s for subsequent calls (measured per utterance).
+        Without this, the first audio of a turn lands after llm_end and
+        partial streaming provides no benefit. KPipeline is lazy:
+        inference runs when the returned generator is iterated, so the
+        throwaway call must be drained.
+        """
+        logger.info("Pre-warming Kokoro pipeline (throwaway generation)...")
+        t0 = _time.time()
+        try:
+            for _ in self.pipeline("Hello.", voice=self.speaker,
+                                    speed=self.speed, split_pattern=r'\n+'):
+                pass
+            logger.info(f"Kokoro pre-warm done in {_time.time() - t0:.1f}s")
+        except Exception as e:
+            logger.warning(f"Kokoro pre-warm failed (first synthesis may be slow): {e}")
 
     def interrupt(self):
         self.interrupt_event.set()
@@ -328,16 +395,16 @@ class KokoroTTSProcessor:
 
         # Kokoro doesn't handle certain characters well. Remove them.
         remove_characters_list=["**","\n"]
-        for n in remove_list:
-            if a.find(n) > -1:
-                a.replace(n,"")
+        for n in remove_characters_list:
+            if text.find(n) > -1:
+                text=text.replace(n,"")
 
         logger.info(f"TTS synthesizing chunk: \"{text[:80]}...\"")
         gen_start = _time.time()
 
         try:
             # Generate generator object (uses default voice 'af_sarah')
-            generator = self.pipeline(text, voice=self.speaker, speed=1.0, split_pattern=r'\n+')
+            generator = self.pipeline(text, voice=self.speaker, speed=self.speed, split_pattern=r'\n+')
 
             gen_time = _time.time() - gen_start
             logger.info(f"Model generation done in {gen_time:.1f}s")
@@ -615,6 +682,126 @@ async def handle_tts(websocket, tts_handler):
 
     heartbeat_task = asyncio.create_task(send_heartbeats())
     
+    # Audio sequence counter. Reset for every TTS input message: the client
+    # re-baselines its per-turn seq offset on every audio_end, and a
+    # streamed response now sends one audio_end per input message.
+    global_audio_seq = 0
+
+    # TTS inputs are queued and handled by a single worker task so audio
+    # chunks are always sent in order and an interrupt cancels the whole
+    # in-flight generation chain (queued messages are dropped).
+    tts_input_queue: asyncio.Queue = asyncio.Queue()
+    tts_worker = None
+
+    def log_tts_worker_error(t):
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc:
+            logger.error(f"TTS worker error: {exc}")
+
+    async def process_tts_worker():
+        """Process queued TTS input messages strictly in order.
+
+        Each message gets its own audio_seq counter and sends its own
+        audio_end, so a streamed response delivers several audio streams
+        in sequence. Only the turn-final input (partial=False) carries
+        "final": true in its audio_end; the server ends the speaking
+        turn on that one (or on an interrupt), not on every per-sentence
+        end.
+        """
+        nonlocal global_audio_seq
+        while True:
+            text, partial, turn_id = await tts_input_queue.get()
+            # New response: reset dedup state (and any stale interrupt
+            # event) so a previous, possibly interrupted, turn cannot
+            # swallow this text.
+            if turn_id is not None and turn_id != tts_handler.current_turn_id:
+                tts_handler.reset_buffer(turn_id)
+            # Interrupted while queued (user barge-in): drop it.
+            if tts_handler.tts_processor.interrupt_event.is_set():
+                continue
+            global_audio_seq = 0
+
+            local_chunk_id = 0
+            chunk_queue: asyncio.Queue = asyncio.Queue()
+            generation_complete = asyncio.Event()
+
+            def generate_chunks():
+                try:
+                    if partial:
+                        # Partial token - accumulate and process incrementally
+                        for chunk in tts_handler.accumulate_text(text, partial=True):
+                            if isinstance(chunk, dict):
+                                logger.info("Partial Queuing audio")
+                                chunk_queue.put_nowait(chunk)
+                                logger.info("... Queued audio")
+                    else:
+                        # Complete response - flush the remainder (words
+                        # already spoken via partials are deduplicated)
+                        for chunk in tts_handler.accumulate_text(text, partial=False):
+                            logger.info("Complete Queuing audio")
+                            chunk_queue.put_nowait(chunk)
+                            logger.info("... Queued audio")
+                except Exception as e:
+                    logger.error(f"Generation error: {e}")
+                finally:
+                    generation_complete.set()
+                    # Sentinel so the pump below wakes up the moment
+                    # generation ends; otherwise a generation that yields no
+                    # chunks (e.g. fully de-duplicated) stalls the pump for
+                    # a full queue timeout (2.0 s) per message.
+                    chunk_queue.put_nowait(None)
+
+            gen_task = asyncio.create_task(asyncio.to_thread(generate_chunks))
+
+            while not generation_complete.is_set():
+                try:
+                    chunk = await asyncio.wait_for(chunk_queue.get(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    # No chunk within the window. If generation has since
+                    # finished, the loop condition exits; otherwise a slow
+                    # synthesis is in flight and we simply keep waiting.
+                    continue
+                if chunk is None:
+                    # Generation-finished sentinel: break so the drain
+                    # below picks up any chunks queued after the last yield.
+                    break
+                if chunk.get("interrupted"):
+                    break
+                chunk["audio_seq"] = global_audio_seq
+                global_audio_seq += 1
+                chunk["turn_id"] = tts_handler.current_turn_id
+                await websocket.send(json.dumps(chunk))
+                logger.info(f"sent audio chunk seq={global_audio_seq - 1}")
+                local_chunk_id += 1
+
+            # Wait for generation to fully complete
+            await gen_task
+
+            # Drain remaining chunks
+            while not chunk_queue.empty():
+                try:
+                    chunk = chunk_queue.get_nowait()
+                    if chunk is None or chunk.get("interrupted"):
+                        break
+                    chunk["audio_seq"] = global_audio_seq
+                    global_audio_seq += 1
+                    chunk["turn_id"] = tts_handler.current_turn_id
+                    await websocket.send(json.dumps(chunk))
+                    local_chunk_id += 1
+                except Exception:
+                    break
+
+            await websocket.send(json.dumps({
+                "type": "audio_end",
+                "total_chunks": local_chunk_id,
+                "turn_id": tts_handler.current_turn_id,
+                "final": not partial,
+            }))
+            if local_chunk_id > 0:
+                logger.info(f"TTS generation complete ({local_chunk_id} chunks)")
+
     try:
         # Wait for client message
         try:
@@ -629,10 +816,6 @@ async def handle_tts(websocket, tts_handler):
         except asyncio.TimeoutError:
             logger.error("Timeout waiting for TTS start message")
             return
-
-        # Global audio sequence counter for ordering chunks across responses
-        global_audio_seq = 0
-        current_tts_task = None
 
         # Process incoming messages
         async for message in websocket:
@@ -654,91 +837,24 @@ async def handle_tts(websocket, tts_handler):
 
                     logger.info(f"TTS received text (partial={partial}, turn_id={turn_id}): \"{text[:80]}...\"")
 
-                    # Reset buffer on new complete response
-                    if not partial:
-                        global_audio_seq = 0
-                        tts_handler.reset_buffer(turn_id)
-
-                    async def process_tts_input():
-                        nonlocal global_audio_seq, current_tts_task
-                        current_tts_task = asyncio.current_task()
-                        local_chunk_id = 0
-
-                        def generate_chunks():
-                            try:
-                                if partial:
-                                    # Partial token - accumulate and process incrementally
-                                    for chunk in tts_handler.accumulate_text(text, partial=True):
-                                        if isinstance(chunk, dict):
-                                            logger.info(f"Partial Queuing audio")
-                                            chunk_queue.put_nowait(chunk)
-                                            logger.info(f"... Queued audio")
-                                else:
-                                    # Complete response - process sentence by sentence in order
-                                    for chunk in tts_handler.generate_sentences_in_order(text):
-                                        logger.info(f"Complete Queuing audio")
-                                        chunk_queue.put_nowait(chunk)
-                                        logger.info(f"... Queued audio")
-                            except Exception as e:
-                                logger.error(f"Generation error: {e}")
-                            generation_complete.set()
-
-                        gen_task = asyncio.create_task(asyncio.to_thread(generate_chunks))
-
-                        while not generation_complete.is_set():
-                            try:
-                                chunk = await asyncio.wait_for(chunk_queue.get(), timeout=2.0)
-                                if chunk.get("interrupted"):
-                                    break
-                                chunk["audio_seq"] = global_audio_seq
-                                global_audio_seq += 1
-                                chunk["turn_id"] = tts_handler.current_turn_id
-                                await websocket.send(json.dumps(chunk))
-                                logger.info(f"sending audio") #: {chunk}
-                                local_chunk_id += 1
-                            except asyncio.TimeoutError:
-                                continue
-
-                        # Wait for generation to fully complete
-                        await gen_task
-
-                        # Drain remaining chunks
-                        while not chunk_queue.empty():
-                            try:
-                                chunk = chunk_queue.get_nowait()
-                                if chunk.get("interrupted"):
-                                    break
-                                chunk["audio_seq"] = global_audio_seq
-                                global_audio_seq += 1
-                                chunk["turn_id"] = tts_handler.current_turn_id
-                                await websocket.send(json.dumps(chunk))
-                                local_chunk_id += 1
-                            except Exception:
-                                break
-
-                        await websocket.send(json.dumps({
-                            "type": "audio_end",
-                            "total_chunks": local_chunk_id,
-                            "turn_id": tts_handler.current_turn_id,
-                        }))
-                        if local_chunk_id > 0:
-                            logger.info(f"TTS generation complete ({local_chunk_id} chunks)")
-
-                    chunk_queue: asyncio.Queue = asyncio.Queue()
-                    generation_complete = asyncio.Event()
-                    logger.info("starting task: process_tts_input()")
-                    current_tts_task = asyncio.create_task(process_tts_input())
-                    current_tts_task.add_done_callback(
-                        lambda t: logger.error(f"TTS task error: {t.exception()}") if t.exception() else None
-                    )
+                    if tts_worker is None or tts_worker.done():
+                        tts_worker = asyncio.create_task(process_tts_worker())
+                        tts_worker.add_done_callback(log_tts_worker_error)
+                    await tts_input_queue.put((text, partial, turn_id))
 
                 elif msg_type == "stop_generation" or msg_type == "stop":
                     tts_handler.interrupt()
-                    if current_tts_task and not current_tts_task.done():
-                        current_tts_task.cancel()
+                    if tts_worker is not None and not tts_worker.done():
+                        tts_worker.cancel()
+                    while tts_input_queue.qsize():
+                        try:
+                            tts_input_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
                     await websocket.send(json.dumps({
                         "type": "audio_end",
                         "interrupted": True,
+                        "final": True,
                         "turn_id": tts_handler.current_turn_id,
                     }))
                     logger.info("TTS generation stopped (interrupt)")
@@ -763,6 +879,12 @@ async def handle_tts(websocket, tts_handler):
     except Exception as e:
         logger.error(f"TTS connection error: {e}")
     finally:
+        if tts_worker is not None and not tts_worker.done():
+            tts_worker.cancel()
+            try:
+                await tts_worker
+            except (asyncio.CancelledError, Exception):
+                pass
         heartbeat_task.cancel()
         try:
             await heartbeat_task
@@ -778,7 +900,7 @@ async def main():
     # Create TTS processor (loads and pre-warms model)
     logger.info(f"Initializing Qwen3-TTS with model: {TTS_MODEL}")
     if TTS_MODEL.find("Kokoro") > -1:
-        tts_processor = KokoroTTSProcessor()
+        tts_processor = KokoroTTSProcessor(device="xpu",speaker="af_sarah",speed=1.3,model_path=None,voice_instruct=None,language="en")
     elif TTS_MODEL.find("Qwen") > -1:
         tts_processor = QwenTTSProcessor(
             model_path=TTS_MODEL,
